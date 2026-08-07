@@ -128,7 +128,7 @@ async def analyze_profile_endpoint(
 
 
 # ---------------------------------------------------------------------------
-# 4. NOWOCZESNY INTERFEJS GRAFICZNY (ZAMIAST SUROWEGO JSONA)
+# 4. NOWOCZESNY INTERFEJS GRAFICZNY Z PODGLĄDEM ZDJĘĆ
 # ---------------------------------------------------------------------------
 @app.get("/test", response_class=HTMLResponse)
 def test_interface():
@@ -212,18 +212,62 @@ def test_interface():
                 cursor: pointer;
                 font-weight: 500;
                 font-size: 14px;
-                margin-bottom: 12px;
+                margin-bottom: 15px;
             }
 
             .file-label:hover {
                 background: #475569;
             }
 
-            #file-count {
-                display: block;
-                color: var(--text-muted);
-                font-size: 13px;
-                margin-bottom: 15px;
+            /* Galeria miniaturek */
+            .preview-grid {
+                display: grid;
+                grid-template-columns: repeat(auto-fill, minmax(90px, 1fr));
+                gap: 12px;
+                margin-bottom: 20px;
+            }
+
+            .preview-item {
+                position: relative;
+                width: 100%;
+                padding-top: 133%; /* Proporcje ok. 3:4 dla zdjęć profilowych */
+                border-radius: 8px;
+                overflow: hidden;
+                background: #0f172a;
+                border: 1px solid var(--border-color);
+            }
+
+            .preview-item img {
+                position: absolute;
+                top: 0;
+                left: 0;
+                width: 100%;
+                height: 100%;
+                object-fit: cover;
+            }
+
+            .remove-btn {
+                position: absolute;
+                top: 4px;
+                right: 4px;
+                background: rgba(15, 23, 42, 0.75);
+                color: #f43f5e;
+                border: none;
+                border-radius: 50%;
+                width: 22px;
+                height: 22px;
+                font-size: 12px;
+                font-weight: bold;
+                cursor: pointer;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                line-height: 1;
+            }
+
+            .remove-btn:hover {
+                background: #f43f5e;
+                color: white;
             }
 
             .submit-btn {
@@ -364,9 +408,12 @@ def test_interface():
         <div class="upload-card">
             <form id="auditForm">
                 <label for="fileInput" class="file-label">📁 Wybierz zdjęcia profilu</label>
-                <input type="file" id="fileInput" name="files" multiple accept="image/*" required>
-                <span id="file-count">Nie wybrano plików</span>
-                <button type="submit" class="submit-btn" id="submitBtn">Rozpocznij Audyt</button>
+                <input type="file" id="fileInput" name="files" multiple accept="image/*">
+                
+                <!-- Siatka na miniaturki podglądu -->
+                <div class="preview-grid" id="previewGrid"></div>
+
+                <button type="submit" class="submit-btn" id="submitBtn" disabled>Rozpocznij Audyt</button>
             </form>
         </div>
 
@@ -404,29 +451,62 @@ def test_interface():
 
     <script>
         const fileInput = document.getElementById('fileInput');
-        const fileCount = document.getElementById('file-count');
+        const previewGrid = document.getElementById('previewGrid');
         const form = document.getElementById('auditForm');
         const loader = document.getElementById('loader');
         const results = document.getElementById('results');
         const submitBtn = document.getElementById('submitBtn');
 
-        fileInput.addEventListener('change', () => {
-            const count = fileInput.files.length;
-            fileCount.textContent = count > 0 ? `Wybrano plików: ${count}` : 'Nie wybrano plików';
+        let selectedFiles = [];
+
+        fileInput.addEventListener('change', (e) => {
+            const newFiles = Array.from(e.target.files);
+            selectedFiles = [...selectedFiles, ...newFiles];
+            updatePreview();
+            fileInput.value = ''; // Resetujemy input, aby można było dodawać pliki partiami
         });
+
+        function updatePreview() {
+            previewGrid.innerHTML = '';
+            
+            if (selectedFiles.length > 0) {
+                submitBtn.disabled = false;
+            } else {
+                submitBtn.disabled = true;
+            }
+
+            selectedFiles.forEach((file, index) => {
+                const reader = new FileReader();
+                reader.onload = (e) => {
+                    const item = document.createElement('div');
+                    item.className = 'preview-item';
+                    item.innerHTML = `
+                        <img src="${e.target.result}" alt="Podgląd">
+                        <button type="button" class="remove-btn" onclick="removeFile(${index})">✕</button>
+                    `;
+                    previewGrid.appendChild(item);
+                };
+                reader.readAsDataURL(file);
+            });
+        }
+
+        function removeFile(index) {
+            selectedFiles.splice(index, 1);
+            updatePreview();
+        }
 
         form.addEventListener('submit', async (e) => {
             e.preventDefault();
-            if (fileInput.files.length === 0) return;
+            if (selectedFiles.length === 0) return;
 
             loader.style.display = 'block';
             results.style.display = 'none';
             submitBtn.disabled = true;
 
             const formData = new FormData();
-            for (let i = 0; i < fileInput.files.length; i++) {
-                formData.append('files', fileInput.files[i]);
-            }
+            selectedFiles.forEach((file) => {
+                formData.append('files', file);
+            });
 
             try {
                 const response = await fetch('/analyze-profile', {
