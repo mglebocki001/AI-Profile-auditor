@@ -1,0 +1,53 @@
+{
+  "profile_name": "Ebuka Okeke, 24",
+  "total_photos_analyzed": 3,
+  "one_great_thing": "Naturalny uśmiech oraz swobodny, pozytywny styl na zdjęciu w basenie (Zdjęcie 1).",
+  "profile_text_data": {
+    "raw_bio_text": "Friendly and easy going human, feel free and vibe",
+    "categories_and_badges": [
+      "Codziennie"
+    ],
+    "interests_and_passions": [
+      "Media społecznościowe",
+      "Muzyka rockowa"
+    ]
+  },
+  "extracted_rules": [
+    {
+      "rule_name": "Zdjęcie w basenie w słoneczny dzień",
+      "category": "Otoczenie",
+      "full_description": "Pozowane zdjęcie w basenie na otwartym powietrzu, pokazujące pozytywną energię i uśmiech.",
+      "what_to_look_for": [
+        "basen",
+        "uśmiech",
+        "słoneczny dzień",
+        "bez koszulki"
+      ],
+      "photo_index": 1
+    },
+    {
+      "rule_name": "Selfie w łazience przed lustrem",
+      "category": "Jakość i Kadrowanie",
+      "full_description": "Selfie bez koszulki w łazience z ręcznikiem na ramieniu, zasłaniające częściowo twarz telefonem.",
+      "what_to_look_for": [
+        "lustro",
+        "łazienka",
+        "telefon w ręku",
+        "ręcznik"
+      ],
+      "photo_index": 2
+    },
+    {
+      "rule_name": "Zdjęcie całej sylwetki w sklepie",
+      "category": "Sylwetka",
+      "full_description": "Kadr pokazujący całą sylwetkę z boku podczas oglądania ubrań w sklepie odzieżowym.",
+      "what_to_look_for": [
+        "cała sylwetka",
+        "sklep odzieżowy",
+        "jasna stylizacja",
+        "torba"
+      ],
+      "photo_index": 3
+    }
+  ]
+}

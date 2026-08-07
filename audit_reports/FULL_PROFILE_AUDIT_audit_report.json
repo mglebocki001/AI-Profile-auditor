@@ -1,0 +1,44 @@
+{
+  "profile_name": "FULL_PROFILE_AUDIT",
+  "total_issues": 3,
+  "critical_issues_count": 2,
+  "overall_score": 48.0,
+  "detected_issues": [
+    {
+      "section": "Styl i Ubiór",
+      "rule_name": "Ubiór noszony na co dzień w zdjęciach profilowych",
+      "severity": "HIGH",
+      "detected_in": "Zdjęcie całej sylwetki w sklepie",
+      "impact_or_reason": "Ubrania, które wyglądają na nowe, nienoszone lub niepasujące do stylu życia, mogą sugerować brak autentyczności, niską praktyczność lub nawet desperację o wyglądanie lepiej niż się jest w rzeczywistości.",
+      "recommendation": "Wybierz ubrania, które regularnie nosisz i czujesz się w nich dobrze. Unikaj strojów, które wyglądają na specjalnie kupione lub noszone tylko raz. Jeśli masz wątpliwości, zrób zdjęcie w ubraniu, które nosisz przynajmniej kilka razy w tygodniu.",
+      "verified_by_human": false,
+      "relevance_score": 0.74,
+      "matched_by_keywords": true
+    },
+    {
+      "section": "Zachowanie w miejscu publicznym",
+      "rule_name": "Unikanie przesadnie odsłoniętych selfie na siłowni i w miejscach publicznych",
+      "severity": "CRITICAL",
+      "detected_in": "Selfie w łazience przed lustrem",
+      "impact_or_reason": "Wywołanie wrażenia narcyzmu, braku szacunku dla innych lub nieadekwatnego poczucia własnej wartości, co może zniechęcić potencjalnych partnerów.",
+      "recommendation": "Zastąp zdjęcia z siłowni lub łazienki naturalnymi ujęciami z aktywności fizycznej, które nie naruszają prywatności innych osób i nie eksponują ciała w sposób nachalny. Skup się na zdjęciach, które pokazują zaangażowanie w aktywność, a nie wyłącznie wygląd fizyczny.",
+      "verified_by_human": false,
+      "relevance_score": 0.68,
+      "matched_by_keywords": true
+    },
+    {
+      "section": "Atmosfera i Nastroj",
+      "rule_name": "Utrzymywanie pozytywnej i rozluźnionej atmosfery podczas sesji zdjęciowej",
+      "severity": "CRITICAL",
+      "detected_in": "Zdjęcie w basenie w słoneczny dzień",
+      "impact_or_reason": "Napięcie i stres podczas sesji prowadzą do sztywnych, nienaturalnych ujęć, które mogą sprawiać wrażenie niepewności lub braku autentyczności.",
+      "recommendation": "Przed sesją zrelaksuj się — posłuchaj ulubionej muzyki, wykonaj kilka ćwiczeń oddechowych lub porozmawiaj z fotografem na luzie. Podczas sesji pozwól sobie na spontaniczne reakcje i nie obawiaj się śmiać lub żartować — to pomoże rozładować napięcie.",
+      "verified_by_human": false,
+      "relevance_score": 0.61,
+      "matched_by_keywords": true
+    }
+  ],
+  "positive_highlights": [
+    "Główny atut: Naturalny uśmiech oraz swobodny, pozytywny styl na zdjęciu w basenie (Zdjęcie 1)."
+  ]
+}
