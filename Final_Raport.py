@@ -1,4 +1,5 @@
 import os
+import gc
 import json
 from pathlib import Path
 from typing import Optional
@@ -13,7 +14,7 @@ API_KEY = os.getenv("GEMINI_API_KEY")
 
 
 # ---------------------------------------------------------------------------
-# 2. STRUKTURA WYJŚCIOWA (Pydantic Schema)
+# 2. STRUKTURA WYJŚCIOWA (Pydantic Schema) — bez zmian
 # ---------------------------------------------------------------------------
 class ImprovementItem(BaseModel):
     title: str = Field(description="Krótkie, chwytliwe nazwanie błędu/zmiany (max 5 słów).")
@@ -59,7 +60,6 @@ def generate_summary_for_reports(reports_dir: str, output_dir: str):
 
     print(f"🚀 Znaleziono {len(report_files)} raportów z audytu. Generuję syntezę przez Gemini API...\n")
 
-    # Wczytanie wszystkich zgromadzonych raportów audytu
     combined_audits = []
     for rep in report_files:
         with open(rep, "r", encoding="utf-8") as f:
@@ -80,6 +80,12 @@ Wymagania:
 5. Skup się na zmianach dających najwyższy zwrot z inwestycji czasu.
 """
 
+    # Duże dane audytu (combined_audits) są już "zamknięte" w prompt jako
+    # string — zwalniamy oryginalną strukturę, żeby nie trzymać dwóch
+    # kopii tych samych danych w pamięci podczas oczekiwania na odpowiedź API.
+    del combined_audits
+    gc.collect()
+
     try:
         response = client.models.generate_content(
             model='gemini-3.6-flash',
@@ -92,8 +98,8 @@ Wymagania:
         )
 
         final_data = ProfileExecutiveSummary.model_validate_json(response.text)
+        del response
 
-        # Drukowanie w konsoli
         print("============================================================")
         print("🌟 KOŃCOWE PODSUMOWANIE DLA UŻYTKOWNIKA")
         print("============================================================")
@@ -108,7 +114,6 @@ Wymagania:
             print(f"   • Wpływ: {item.why_it_matters}")
             print(f"   • 💡 Szybka zmiana: {item.quick_fix}\n")
 
-        # Zapis do pliku
         final_file = output_path / "final_profile_summary.json"
         with open(final_file, "w", encoding="utf-8") as f:
             f.write(final_data.model_dump_json(indent=2))
@@ -117,6 +122,9 @@ Wymagania:
 
     except Exception as e:
         print(f"❌ Błąd podczas generowania podsumowania: {e}")
+    finally:
+        del client
+        gc.collect()
 
 
 if __name__ == "__main__":

@@ -1,15 +1,16 @@
 import shutil
 import os
+import gc
 import json
 from pathlib import Path
 from typing import List
-from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi import FastAPI, UploadFile, File, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 
 # Importy logiki z Twoich skryptów
 from OCR import run_batch_extraction
-from Audit import ProfileAnalyzerEngine
+from Audit import get_engine  # leniwy singleton — patrz Audit.py
 from Final_Raport import generate_summary_for_reports
 
 # ---------------------------------------------------------------------------
@@ -57,6 +58,26 @@ def clean_working_directories():
 
 
 # ---------------------------------------------------------------------------
+# 2b. GLOBALNY HANDLER WYJĄTKÓW (siatka bezpieczeństwa)
+# ---------------------------------------------------------------------------
+# UWAGA: to zabezpiecza przed niezłapanymi wyjątkami Pythona (np. bug w
+# kodzie) — zwraca czysty JSON 500 zamiast crashować worker Uvicorna.
+# NIE naprawia to samo w sobie zabicia procesu przez system operacyjny
+# z powodu przekroczenia limitu RAM (OOM-kill) — to sygnał SIGKILL, na
+# który żaden handler w Pythonie nie zdąży zareagować. Objaw "Unexpected
+# end of JSON input" po stronie klienta jest typowym śladem właśnie OOM-
+# killa w trakcie generowania odpowiedzi — dlatego kluczowe są zmiany w
+# Audit.py/OCR.py, które faktycznie obniżają szczytowe zużycie RAM.
+@app.exception_handler(Exception)
+async def unhandled_exception_handler(request: Request, exc: Exception):
+    gc.collect()
+    return JSONResponse(
+        status_code=500,
+        content={"status": "error", "detail": f"Nieoczekiwany błąd serwera: {str(exc)}"},
+    )
+
+
+# ---------------------------------------------------------------------------
 # 3. ENDPOINT API DO ANALIZY
 # ---------------------------------------------------------------------------
 @app.post("/analyze-profile")
@@ -79,15 +100,22 @@ async def analyze_profile_endpoint(
 
     print(f"📥 Zapisano {len(saved_file_paths)} obrazów w folderze ./photos")
 
+    del files
+    gc.collect()
+
     # Krok 2: Uruchomienie OCR (Gemini Vision API - Zbiorcza analiza w 1 pliku)
     try:
         run_batch_extraction(input_dir=str(PHOTOS_DIR), output_dir=str(OCR_RESULT_DIR))
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Błąd podczas ekstrakcji OCR: {str(e)}")
+    finally:
+        gc.collect()
 
     # Krok 3: Uruchomienie silnika audytu (Audit vs rules.json)
+    # Silnik jest leniwym singletonem (get_engine) — indeks reguł budowany
+    # jest RAZ dla całego procesu, a nie od nowa przy każdym zapytaniu.
     try:
-        analyzer = ProfileAnalyzerEngine(rules_db_path="rules.json")
+        analyzer = get_engine(rules_db_path="rules.json")
         ocr_files = list(OCR_RESULT_DIR.glob("*.json"))
 
         if not ocr_files:
@@ -98,9 +126,15 @@ async def analyze_profile_endpoint(
             out_file = AUDIT_REPORTS_DIR / f"{file.stem}_audit_report.json"
             with open(out_file, "w", encoding="utf-8") as f:
                 f.write(audit.model_dump_json(indent=2))
+            del audit
 
+        del ocr_files
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Błąd podczas audytu reguł: {str(e)}")
+    finally:
+        gc.collect()
 
     # Krok 4: Generowanie końcowego raportu podsumowującego
     try:
@@ -110,7 +144,7 @@ async def analyze_profile_endpoint(
         )
 
         final_file = FINAL_SUMMARY_DIR / "final_profile_summary.json"
-        
+
         if not final_file.exists():
             raise HTTPException(status_code=500, detail="Błąd: Plik finalnego raportu nie został utworzony.")
 
@@ -123,8 +157,12 @@ async def analyze_profile_endpoint(
             "data": final_data
         }
 
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Błąd podczas generowania finalnego raportu: {str(e)}")
+    finally:
+        gc.collect()
 
 
 # ---------------------------------------------------------------------------

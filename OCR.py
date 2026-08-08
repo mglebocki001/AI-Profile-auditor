@@ -1,6 +1,8 @@
 import os
+import gc
 import json
 import time
+from io import BytesIO
 from pathlib import Path
 from typing import List, Optional
 from PIL import Image
@@ -13,22 +15,31 @@ load_dotenv()
 
 API_KEY = os.getenv("GEMINI_API_KEY")
 
+# Zdjęcia z telefonu potrafią mieć 3000-4000px i po dekompresji do surowej
+# bitmapy zajmować kilkadziesiąt MB KAŻDE (np. 4032x3024 RGB ≈ 36 MB).
+# Przy 8-10 zdjęciach jednego profilu trzymanych naraz w pamięci to już
+# 300-400 MB tylko na same bitmapy — zanim jeszcze cokolwiek wyślemy do API.
+# Zamiast tego: każde zdjęcie skalujemy i kompresujemy do JPEG w locie,
+# a surową bitmapę zwalniamy natychmiast po kompresji.
+MAX_DIMENSION = 1024
+JPEG_QUALITY = 82
+
 
 # ---------------------------------------------------------------------------
-# 1. PRECYZYJNY SCHEMAT DANYCH (Rozróżnienie UI aplikacji randkowych)
+# 1. PRECYZYJNY SCHEMAT DANYCH (bez zmian)
 # ---------------------------------------------------------------------------
 
 class ProfileBioSection(BaseModel):
     raw_bio_text: Optional[str] = Field(
-        default=None, 
+        default=None,
         description="Rzeczywisty opis pisany przez użytkownika (Bio/Prompt). NIE umieszczaj tu tagów ani kategorii."
     )
     categories_and_badges: List[str] = Field(
-        default_factory=list, 
+        default_factory=list,
         description="Sztywne kategorie/plakietki z interfejsu aplikacji (np. Wzrost, Zodiak, Wykształcenie, Stanowisko, Alkohol, Papierosy, Dzieci)."
     )
     interests_and_passions: List[str] = Field(
-        default_factory=list, 
+        default_factory=list,
         description="Zainteresowania, hobby, tagi i pasje wybierane z listy (np. 'Kawa', 'Muzyka', 'Podróże', 'Gym')."
     )
 
@@ -43,7 +54,7 @@ class VisualRuleDetail(BaseModel):
         description="Dokładny opis elementu widocznego na kadrze zdjęć."
     )
     what_to_look_for: List[str] = Field(
-        default_factory=list, 
+        default_factory=list,
         description="Detale wizualne na zdjęciu (np. 'ciemne okulary', 'bałagan w tle', 'uśmiech', 'zdjęcie w grupie')."
     )
     photo_index: Optional[int] = Field(
@@ -62,25 +73,46 @@ class SingleProfileFullAudit(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# 2. LOGIKA PRZETWARZANIA PACZKI ZDJĘĆ W JEDNYM AUDYCIE
+# 2. KOMPRESJA ZDJĘĆ (nowość — kluczowa dla RAM)
+# ---------------------------------------------------------------------------
+
+def _load_compressed_jpeg_bytes(path: Path) -> Optional[bytes]:
+    """Otwiera zdjęcie, skaluje do max MAX_DIMENSION px i zwraca skompresowane
+    bajty JPEG. Oryginalna, surowa bitmapa jest zwalniana natychmiast po
+    wyjściu z bloku `with` — nie zostaje w pamięci."""
+    try:
+        with Image.open(path) as img:
+            img = img.convert("RGB")
+            img.thumbnail((MAX_DIMENSION, MAX_DIMENSION), Image.LANCZOS)
+            buffer = BytesIO()
+            img.save(buffer, format="JPEG", quality=JPEG_QUALITY, optimize=True)
+            data = buffer.getvalue()
+        return data
+    except Exception as e:
+        print(f"❌ Błąd podczas otwierania/kompresji pliku {path.name}: {e}")
+        return None
+
+
+# ---------------------------------------------------------------------------
+# 3. LOGIKA PRZETWARZANIA PACZKI ZDJĘĆ W JEDNYM AUDYCIE
 # ---------------------------------------------------------------------------
 
 def process_single_profile(client: genai.Client, image_paths: List[Path]) -> Optional[SingleProfileFullAudit]:
-    """Przesyła WSZYSTKIE zdjęcia jednego profilu równolegle do Gemini i zwraca JEDEN audyt."""
+    """Przesyła WSZYSTKIE zdjęcia jednego profilu do Gemini i zwraca JEDEN audyt.
+    Zdjęcia są kompresowane pojedynczo (nie wszystkie naraz jako pełnowymiarowe
+    obiekty PIL) — w pamięci trzymane są tylko lekkie, skompresowane bajty JPEG."""
     print(f"🔄 Analizowanie pełnego profilu z {len(image_paths)} zdjęć...")
-    
-    images = []
-    for path in image_paths:
-        try:
-            img = Image.open(path)
-            images.append(img)
-        except Exception as e:
-            print(f"❌ Błąd podczas otwierania pliku {path.name}: {e}")
 
-    if not images:
+    image_parts: List[types.Part] = []
+    for path in image_paths:
+        jpeg_bytes = _load_compressed_jpeg_bytes(path)
+        if jpeg_bytes is not None:
+            image_parts.append(types.Part.from_bytes(data=jpeg_bytes, mime_type="image/jpeg"))
+        del jpeg_bytes
+
+    if not image_parts:
         return None
 
-    # Ścisłe instrukcje eliminujące generyczne pochwały i mylenie opisu z kategoriami
     prompt = """
 Jesteś profesjonalnym, wymagającym i bezstronnym audytorem profili w aplikacjach randkowych (Tinder, Bumble, Hinge).
 
@@ -97,7 +129,7 @@ ZASADY ANALIZY:
 8. PRZEPROWADŹ KONTROLĘ BRAKÓW: Zidentyfikuj brak kluczowych elementów profilu (np. brak zdjęcia całej sylwetki, brak naturalnego uśmiechu, brak widocznych oczu przez okulary przeciwsłoneczne, brak interakcji z otoczeniem, pusty opis).
 
 WYMAGANY FORMAT WYJŚCIOWY:
-Zwróć wynik WYŁĄCZNIE w poprawnym formacie JSON. 
+Zwróć wynik WYŁĄCZNIE w poprawnym formacie JSON.
 ZASADA KRYTYCZNA JSON: Nie umieszczaj wiszących przecinków (trailing commas) na końcu tablic ani obiektów!
 
 Struktura JSON musi wyglądać dokładnie tak:
@@ -159,10 +191,10 @@ Struktura JSON musi wyglądać dokładnie tak:
 }
 """
 
-
-    contents = [*images, prompt]
+    contents = [*image_parts, prompt]
 
     max_retries = 3
+    result: Optional[SingleProfileFullAudit] = None
     for attempt in range(max_retries):
         try:
             response = client.models.generate_content(
@@ -174,8 +206,10 @@ Struktura JSON musi wyglądać dokładnie tak:
                     temperature=0.1
                 ),
             )
-            
-            return SingleProfileFullAudit.model_validate_json(response.text)
+
+            result = SingleProfileFullAudit.model_validate_json(response.text)
+            del response
+            break
 
         except Exception as e:
             error_msg = str(e)
@@ -185,13 +219,17 @@ Struktura JSON musi wyglądać dokładnie tak:
                 time.sleep(wait_time)
             else:
                 print(f"❌ Błąd podczas wywołania API dla profilu: {e}")
-                return None
+                break
 
-    return None
+    # Zwalniamy skompresowane bajty obrazów i listę contents niezależnie od wyniku
+    del contents, image_parts
+    gc.collect()
+
+    return result
 
 
 def run_batch_extraction(input_dir: str, output_dir: str):
-    """Zbiega wszystkie zdjęcia z folderu i generuje z nich JEDEN plik audytu JSON."""
+    """Zbiera wszystkie zdjęcia z folderu i generuje z nich JEDEN plik audytu JSON."""
     if API_KEY == "TUTAJ_WKLEJ_SWOJ_KLUCZ_API_GEMINI":
         print("❌ BŁĄD: Musisz wkleić swój klucz API na początku pliku!")
         return
@@ -211,15 +249,14 @@ def run_batch_extraction(input_dir: str, output_dir: str):
 
     print(f"🚀 Znaleziono łącznie {len(images)} obrazów. Łączę je w JEDEN audyt profilu...\n")
 
-    # Przetwarzanie całej paczki obrazów równolegle w jednym zapytaniu
     result = process_single_profile(client, images)
 
     if result:
         output_file = output_path / "FULL_PROFILE_AUDIT.json"
-        
+
         with open(output_file, "w", encoding="utf-8") as f:
             f.write(result.model_dump_json(indent=2))
-            
+
         print("="*65)
         print("✅ GENIALNIE! Wygenerowano JEDEN skumulowany raport audytu.")
         print(f"📁 Plik zapisano w: {output_file.name}")
@@ -231,10 +268,13 @@ def run_batch_extraction(input_dir: str, output_dir: str):
         print(f"🔍 Wszystkich zebranych reguł wizualnych: {len(result.extracted_rules)}")
         print("="*65 + "\n")
 
+    del client
+    gc.collect()
+
 
 if __name__ == "__main__":
     INPUT_FOLDER = "./photos"       # Włóż tutaj WSZYSTKIE zdjęcia danego profilu
     OUTPUT_FOLDER = "./OCR_result"   # Tu powstanie JEDEN plik FULL_PROFILE_AUDIT.json
-    
+
     os.makedirs(INPUT_FOLDER, exist_ok=True)
     run_batch_extraction(INPUT_FOLDER, OUTPUT_FOLDER)

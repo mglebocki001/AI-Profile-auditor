@@ -1,24 +1,26 @@
+import gc
 import json
+import math
+import re
+from collections import Counter
 from pathlib import Path
 from typing import List, Dict, Any, Optional
 from pydantic import BaseModel
-import chromadb
-from chromadb.utils import embedding_functions
 
 # ---------------------------------------------------------------------------
-# 1. STRUKTURA RAPORTU AUDYTU (Pydantic Schema)
+# 1. STRUKTURA RAPORTU AUDYTU (Pydantic Schema) — bez zmian
 # ---------------------------------------------------------------------------
 
 class AuditIssue(BaseModel):
-    section: str  # kategoria reguły, np. "Ekspozycja Twarzy", "Opis profilu"
+    section: str
     rule_name: str
-    severity: str  # CRITICAL, HIGH, MEDIUM, LOW
+    severity: str
     detected_in: str
     impact_or_reason: str
     recommendation: str
     verified_by_human: bool = False
-    relevance_score: float = 0.0  # Końcowa waga dopasowania reguły
-    matched_by_keywords: bool = False  # Czy dopasowanie wsparte było twardym trafieniem słów kluczowych
+    relevance_score: float = 0.0
+    matched_by_keywords: bool = False
 
 class ProfileAuditReport(BaseModel):
     profile_name: str
@@ -45,13 +47,7 @@ def _priority_score_to_severity(score: int) -> str:
 
 
 def _keyword_overlap_score(query_text: str, trigger_keywords_joined: str) -> float:
-    """
-    Twardy sygnał leksykalny — niezależny od jakości embeddingu.
-    Liczy ile fraz kluczowych reguły dosłownie występuje w tekście zapytania
-    (case-insensitive). 2+ trafienia = maksymalny wynik.
-    Działa jako "kotwica", która ratuje trafne dopasowania w sytuacji,
-    gdy model embeddingowy słabo radzi sobie z polskim tekstem.
-    """
+    """Twardy sygnał leksykalny — bez zmian względem oryginału."""
     if not trigger_keywords_joined:
         return 0.0
 
@@ -66,84 +62,129 @@ def _keyword_overlap_score(query_text: str, trigger_keywords_joined: str) -> flo
 
 
 # ---------------------------------------------------------------------------
-# 3. SILNIK AUDYTU Z HYBRYDOWYM MATCHINGIEM WEKTOROWYM
+# 3. LEKKI INDEKS TF-IDF (ZASTĘPUJE ChromaDB + sentence-transformers/PyTorch)
+# ---------------------------------------------------------------------------
+#
+# UWAGA DOT. JAKOŚCI DOPASOWANIA (świadomy kompromis RAM vs jakość):
+# Poprzedni silnik używał modelu "paraphrase-multilingual-mpnet-base-v2"
+# (transformer, setki MB parametrów + PyTorch w RAM), który dobrze radzi
+# sobie z parafrazami ("brak uśmiechu" ~ "poważna mina"). TF-IDF jest
+# metodą LEKSYKALNĄ — dobrze łapie dosłowne/pokrewne słowa, gorzej czyste
+# parafrazy bez wspólnych rdzeni słów. Dlatego próg trafności i wagi
+# poniżej są przeliczone tak, by silniej opierać się na sygnale keyword
+# (Audit.py i tak już miał "kotwicę" słów kluczowych na wypadek słabego
+# embeddingu — tutaj ta kotwica dźwiga więcej). Jeśli po testach na
+# realnych danych jakość dopasowań okaże się niewystarczająca, zalecany
+# upgrade to embeddingi przez Gemini API (`client.models.embed_content`)
+# zamiast lokalnego modelu — to nadal nie obciąża RAM-u serwera, bo
+# liczenie odbywa się zdalnie, a tutaj trzeba by tylko cache'ować wektory
+# na dysku. Nie wdrożyłem tego domyślnie, żeby nie dodawać zależności
+# sieciowej do KAŻDEGO zapytania audytu bez Twojej zgody.
+
+_TOKEN_RE = re.compile(r"[a-ząćęłńóśźżA-ZĄĆĘŁŃÓŚŹŻ0-9]+")
+
+
+def _tokenize(text: str) -> List[str]:
+    return _TOKEN_RE.findall(text.lower())
+
+
+class _TfidfIndex:
+    """Indeks TF-IDF działający wyłącznie na stdlib. Dla ~600 krótkich
+    dokumentów reguł zajmuje pojedyncze MB RAM zamiast setek MB wymaganych
+    przez lokalny model embeddingowy + PyTorch."""
+
+    def __init__(self):
+        self._idf: Dict[str, float] = {}
+        self._doc_vectors: List[Dict[str, float]] = []
+        self._doc_norms: List[float] = []
+
+    def build(self, docs: List[str]):
+        n_docs = len(docs)
+        tokenized_docs = [_tokenize(d) for d in docs]
+
+        doc_freq = Counter()
+        for tokens in tokenized_docs:
+            for term in set(tokens):
+                doc_freq[term] += 1
+
+        self._idf = {
+            term: math.log((n_docs + 1) / (freq + 1)) + 1.0
+            for term, freq in doc_freq.items()
+        }
+
+        self._doc_vectors = []
+        self._doc_norms = []
+        for tokens in tokenized_docs:
+            vec = self._vectorize(tokens)
+            norm = math.sqrt(sum(w * w for w in vec.values())) or 1e-9
+            self._doc_vectors.append(vec)
+            self._doc_norms.append(norm)
+
+        del tokenized_docs
+        gc.collect()
+
+    def _vectorize(self, tokens: List[str]) -> Dict[str, float]:
+        if not tokens:
+            return {}
+        tf = Counter(tokens)
+        length = len(tokens)
+        return {
+            term: (count / length) * self._idf.get(term, 0.0)
+            for term, count in tf.items()
+        }
+
+    def query(self, text: str) -> List[float]:
+        """Podobieństwo cosinusowe zapytania do WSZYSTKICH dokumentów,
+        w kolejności indeksowania (lista, nie generator — potrzebujemy
+        wielokrotnego zip() z metadanymi w warstwie wyżej)."""
+        if not self._doc_vectors:
+            return []
+        qvec = self._vectorize(_tokenize(text))
+        qnorm = math.sqrt(sum(w * w for w in qvec.values())) or 1e-9
+
+        similarities = []
+        for dvec, dnorm in zip(self._doc_vectors, self._doc_norms):
+            small, big = (qvec, dvec) if len(qvec) < len(dvec) else (dvec, qvec)
+            dot = sum(weight * big.get(term, 0.0) for term, weight in small.items())
+            similarities.append(dot / (qnorm * dnorm))
+        return similarities
+
+
+# ---------------------------------------------------------------------------
+# 4. SILNIK AUDYTU (interfejs publiczny bez zmian — analyze_extracted_json
+#    ma dokładnie ten sam kontrakt co poprzednio)
 # ---------------------------------------------------------------------------
 
 class ProfileAnalyzerEngine:
-    # Próg minimalnej trafności (semantic LUB keyword) poniżej którego
-    # dopasowanie jest odrzucane, niezależnie od bonusów. To eliminuje
-    # przypadkowe, "odklejone" dopasowania w raporcie.
-    MIN_RELEVANCE_THRESHOLD = 0.42
+    MIN_RELEVANCE_THRESHOLD = 0.15  # przeliczone pod TF-IDF, patrz komentarz wyżej
 
-    # Wagi finalnego rankingu — semantyka dominuje, ale keyword overlap
-    # jest teraz osobnym, twardym sygnałem, a nie tylko dodatkiem do similarity.
-    WEIGHT_SEMANTIC = 0.60
-    WEIGHT_KEYWORD = 0.20
+    WEIGHT_SEMANTIC = 0.45
+    WEIGHT_KEYWORD = 0.35
     WEIGHT_HUMAN_VERIFIED = 0.10
     WEIGHT_PRIORITY = 0.10
 
     def __init__(self, rules_db_path: str = "rules.json"):
         self.rules_db_path = Path(rules_db_path)
-
-        # Inicjalizacja bazy ChromaDB
-        self.chroma_client = chromadb.Client()
-
-        # --- (B) MULTILINGUAL EMBEDDING FUNCTION -----------------------
-        # Domyślny embedding Chroma (all-MiniLM-L6-v2) jest trenowany
-        # głównie na angielskim i dla polskich zdań generuje głównie szum
-        # leksykalny zamiast prawdziwego podobieństwa semantycznego.
-        # Zamieniamy go na model wielojęzyczny.
-        #
-        # Wymaga: pip install sentence-transformers
-        # Model pobiera się (i cache'uje lokalnie) przy pierwszym użyciu,
-        # więc pierwsze uruchomienie wymaga dostępu do internetu.
-        self.embedding_function = embedding_functions.SentenceTransformerEmbeddingFunction(
-            model_name="paraphrase-multilingual-mpnet-base-v2"
-        )
-
-        # Tworzenie lub pobieranie kolekcji z resetem pamięci podręcznej
-        self.verified_collection = self.chroma_client.get_or_create_collection(
-            name="dating_rules_verified",
-            embedding_function=self.embedding_function,
-        )
-        self.unverified_collection = self.chroma_client.get_or_create_collection(
-            name="dating_rules_unverified",
-            embedding_function=self.embedding_function,
-        )
-
-        # Czyścimy stare kolekcje przy tworzeniu instancji, zapobiegając dublowaniu reguł
-        if self.verified_collection.count() > 0:
-            self.chroma_client.delete_collection("dating_rules_verified")
-            self.verified_collection = self.chroma_client.get_or_create_collection(
-                name="dating_rules_verified", embedding_function=self.embedding_function
-            )
-
-        if self.unverified_collection.count() > 0:
-            self.chroma_client.delete_collection("dating_rules_unverified")
-            self.unverified_collection = self.chroma_client.get_or_create_collection(
-                name="dating_rules_unverified", embedding_function=self.embedding_function
-            )
-
-        self._verified_count = 0
-        self._unverified_count = 0
+        self._index = _TfidfIndex()
+        self._rule_metas: List[Dict[str, Any]] = []
+        self._loaded = False
 
         if self.rules_db_path.exists():
-            self._build_vector_database()
+            self._build_index()
         else:
             print(f"❌ OSTRZEŻENIE: Brak pliku '{rules_db_path}' w katalogu roboczym!")
 
-    def _build_vector_database(self):
-        """Wczytuje rules.json i indeksuje reguły do odpowiednich kolekcji."""
+    def _build_index(self):
         with open(self.rules_db_path, "r", encoding="utf-8") as f:
             raw_rules = json.load(f)
 
         rules_list = raw_rules.get("rules", []) if isinstance(raw_rules, dict) else raw_rules
+        del raw_rules
 
-        verified_docs, verified_metas, verified_ids = [], [], []
-        unverified_docs, unverified_metas, unverified_ids = [], [], []
+        docs: List[str] = []
+        self._rule_metas = []
 
         for rule in rules_list:
-            rule_id = str(rule.get("id", ""))
             title = rule.get("title", "")
             category = rule.get("category", "")
             keywords_list = rule.get("trigger_keywords", [])
@@ -160,7 +201,8 @@ class ProfileAnalyzerEngine:
             recommendation = rule.get("quick_fix", "")
             impact_text = rule.get("negative_impact") or rule.get("why_it_matters", "")
 
-            metadata = {
+            docs.append(doc_text)
+            self._rule_metas.append({
                 "section": category,
                 "rule_name": title,
                 "severity": _priority_score_to_severity(priority_score),
@@ -168,98 +210,29 @@ class ProfileAnalyzerEngine:
                 "impact": impact_text,
                 "recommendation": recommendation,
                 "verified_by_human": is_verified,
-                "positive_impact": rule.get("positive_impact", ""),
-                # (D) Zapisujemy oryginalne frazy kluczowe (jako string, bo
-                # metadata w Chroma musi być typem prostym), żeby móc policzyć
-                # twardy keyword overlap niezależnie od embeddingu.
                 "trigger_keywords": "|||".join(keywords_list),
-            }
+            })
 
-            if is_verified:
-                verified_docs.append(doc_text)
-                verified_metas.append(metadata)
-                verified_ids.append(rule_id or f"verified_rule_{len(verified_ids)}")
-            else:
-                unverified_docs.append(doc_text)
-                unverified_metas.append(metadata)
-                unverified_ids.append(rule_id or f"unverified_rule_{len(unverified_ids)}")
+        self._index.build(docs)
+        self._loaded = True
 
-        if verified_docs:
-            self.verified_collection.add(
-                documents=verified_docs,
-                metadatas=verified_metas,
-                ids=verified_ids
-            )
-        if unverified_docs:
-            self.unverified_collection.add(
-                documents=unverified_docs,
-                metadatas=unverified_metas,
-                ids=unverified_ids
-            )
+        print(f"📖 Załadowano z '{self.rules_db_path}': {len(docs)} reguł (indeks TF-IDF, bez PyTorch/ChromaDB).")
 
-        self._verified_count = len(verified_docs)
-        self._unverified_count = len(unverified_docs)
-
-        print(
-            f"📖 Załadowano z '{self.rules_db_path}': "
-            f"{self._verified_count} reguł zweryfikowanych oraz {self._unverified_count} niezweryfikowanych (AI)."
-        )
-
-    def _query_collection_with_scores(self, collection, query_text: str, n_results: int) -> List[Dict[str, Any]]:
-        """Pobiera z bazy metadane wraz z obliczonym podobieństwem semantycznym."""
-        if n_results <= 0 or collection.count() == 0:
-            return []
-
-        safe_n = min(n_results, collection.count())
-        results = collection.query(
-            query_texts=[query_text],
-            n_results=safe_n,
-            include=["metadatas", "distances"]
-        )
-
-        matched_list = []
-        if results and "metadatas" in results and results["metadatas"]:
-            metas = results["metadatas"][0]
-            distances = results["distances"][0] if "distances" in results else [1.0] * len(metas)
-
-            for meta, dist in zip(metas, distances):
-                # Konwersja dystansu kosinusowego/L2 na wartość podobieństwa [0.0 - 1.0]
-                similarity = max(0.0, 1.0 - (dist / 2.0))
-                item = dict(meta)
-                item["similarity"] = similarity
-                matched_list.append(item)
-
-        return matched_list
+        del docs, rules_list
+        gc.collect()
 
     def _search_hybrid(self, query_text: str, candidate_k: int = 5) -> List[Dict[str, Any]]:
-        """
-        Przeszukuje OBYDWIE kolekcje naraz.
-        Bierze pod uwagę:
-        1. Zgodność semantyczną (similarity) — wielojęzyczny embedding (B)
-        2. Twardy sygnał ze słów kluczowych (D) — ratuje trafne dopasowania,
-           gdy embedding zawiedzie
-        3. Lekki bonus za weryfikację przez człowieka
-        4. Priority score reguły
-        Kandydaci poniżej MIN_RELEVANCE_THRESHOLD (semantic LUB keyword)
-        są odrzucani (A/C) — to eliminuje "odklejone" dopasowania.
-        """
-        verified_matches = self._query_collection_with_scores(self.verified_collection, query_text, candidate_k)
-        unverified_matches = self._query_collection_with_scores(self.unverified_collection, query_text, candidate_k)
+        if not self._loaded:
+            return []
 
-        all_candidates = verified_matches + unverified_matches
+        similarities = self._index.query(query_text)
         filtered_candidates = []
 
-        for cand in all_candidates:
-            sim = cand.get("similarity", 0.0)
-            keyword_score = _keyword_overlap_score(query_text, cand.get("trigger_keywords", ""))
-            is_verified = cand.get("verified_by_human", False)
-            p_score = cand.get("priority_score", 50) / 100.0
+        for meta, sim in zip(self._rule_metas, similarities):
+            keyword_score = _keyword_overlap_score(query_text, meta.get("trigger_keywords", ""))
+            is_verified = meta.get("verified_by_human", False)
+            p_score = meta.get("priority_score", 50) / 100.0
 
-            # (C) Twardy próg: odrzucamy kandydatów, którzy nie mają ani
-            # sensownego podobieństwa semantycznego, ani trafienia w słowa
-            # kluczowe. Bonusy (human/priority) NIE mogą już "wciągnąć"
-            # niezwiązanej reguły do wyników — liczą się tylko przy remisach
-            # między już-trafnymi kandydatami.
             relevance = max(sim, keyword_score)
             if relevance < self.MIN_RELEVANCE_THRESHOLD:
                 continue
@@ -272,28 +245,17 @@ class ProfileAnalyzerEngine:
                 + (p_score * self.WEIGHT_PRIORITY)
             )
 
+            cand = dict(meta)
+            cand["similarity"] = sim
             cand["keyword_score"] = keyword_score
             cand["matched_by_keywords"] = keyword_score >= 0.5
             cand["final_match_rank"] = final_match_rank
             filtered_candidates.append(cand)
 
-        # Sortujemy od najlepszego wyniku całkowitego w dół
         filtered_candidates.sort(key=lambda x: x["final_match_rank"], reverse=True)
-        return filtered_candidates
+        return filtered_candidates[:candidate_k]
 
     def analyze_extracted_json(self, profile_data_path: str, target_rules_count: int = 5) -> ProfileAuditReport:
-        """
-        Dla KAŻDEJ wykrytej cechy (feature) z audytu OCR wybiera JEJ NAJLEPSZE
-        dopasowanie w bazie reguł (A) — a nie wspólną pulę top-3 ze wszystkich
-        cech naraz. Dzięki temu `detected_in` zawsze wskazuje realne źródło
-        problemu, a nie przypadkowego "zwycięzcę" wyścigu score'ów między
-        niepowiązanymi cechami.
-
-        Dopiero na końcu, jeśli ta sama reguła została realnie i trafnie
-        wykryta dla więcej niż jednej cechy, zostawiamy tylko najlepsze
-        wystąpienie (ale oba kandydaci już przeszły próg trafności, więc
-        to nie jest "podkradanie" wyniku przez niepowiązaną cechę).
-        """
         with open(profile_data_path, "r", encoding="utf-8") as f:
             profile_raw = json.load(f)
 
@@ -317,17 +279,11 @@ class ProfileAnalyzerEngine:
             if not query_text:
                 continue
 
-            # Pobieramy kandydatów już PRZEFILTROWANYCH progiem trafności
             matches = self._search_hybrid(query_text, candidate_k=5)
 
             if not matches:
-                # Brak trafnej reguły dla tej cechy — świadomie pomijamy,
-                # zamiast wymuszać dopasowanie na siłę (to był źródłowy błąd).
                 continue
 
-            # (A) Bierzemy TYLKO najlepsze dopasowanie DLA TEJ KONKRETNEJ cechy.
-            # `detected_in` jest więc zawsze poprawnie przypięty do cechy,
-            # z której zapytanie faktycznie pochodziło.
             best_match = matches[0]
 
             item = {
@@ -346,22 +302,13 @@ class ProfileAnalyzerEngine:
             if feature.get("positive_impact"):
                 positive_highlights.append(f"{feat_name}: {feature['positive_impact']}")
 
-        # 1. Deduplikacja po unikalnej nazwie reguły — teraz bezpieczna, bo
-        #    wszyscy kandydaci już przeszli próg trafności per-cecha (A+C),
-        #    więc wybór "lepszego" wystąpienia nie podmienia detected_in
-        #    na coś niepowiązanego.
         unique_rules_map: Dict[str, Dict[str, Any]] = {}
         for cand in detected_candidates:
             rule_key = f"{cand['section']}_{cand['rule_name']}"
             if rule_key not in unique_rules_map or cand["final_match_rank"] > unique_rules_map[rule_key]["final_match_rank"]:
                 unique_rules_map[rule_key] = cand
 
-        # 2. Sortowanie globalne wszystkich unikalnych dopasowań
         sorted_candidates = sorted(list(unique_rules_map.values()), key=lambda x: x["final_match_rank"], reverse=True)
-
-        # 3. Przycięcie do żądanych ZASAD (może być mniej niż target_rules_count,
-        #    jeśli po odfiltrowaniu szumu nie ma tylu trafnych dopasowań —
-        #    to prawidłowe zachowanie, lepsze niż wymuszanie 5 wyników na siłę).
         selected_rules = sorted_candidates[:target_rules_count]
 
         final_issues = [
@@ -378,13 +325,12 @@ class ProfileAnalyzerEngine:
             ) for c in selected_rules
         ]
 
-        # Wyliczanie punktacji ogólnej
         penalty_map = {"CRITICAL": 20, "HIGH": 12, "MEDIUM": 8, "LOW": 4}
         total_penalty = sum(penalty_map.get(issue.severity, 8) for issue in final_issues)
         overall_score = max(0.0, min(100.0, 100.0 - total_penalty))
         critical_count = sum(1 for i in final_issues if i.severity == "CRITICAL")
 
-        return ProfileAuditReport(
+        report = ProfileAuditReport(
             profile_name=doc_title,
             total_issues=len(final_issues),
             critical_issues_count=critical_count,
@@ -393,9 +339,35 @@ class ProfileAnalyzerEngine:
             positive_highlights=positive_highlights
         )
 
+        del profile_raw, extracted_rules, detected_candidates, unique_rules_map, sorted_candidates
+        gc.collect()
+
+        return report
+
 
 # ---------------------------------------------------------------------------
-# 4. FORMATOWANY WYDRUK RAPORTU
+# 5. LENIWY SINGLETON SILNIKA
+# ---------------------------------------------------------------------------
+# Krytyczne dla RAM/CPU: silnik (i jego indeks TF-IDF) budowany jest RAZ,
+# przy pierwszym użyciu — a nie przy KAŻDYM zapytaniu API, jak to było
+# poprzednio (main.py tworzył `ProfileAnalyzerEngine(...)` wewnątrz
+# endpointu, więc każde żądanie ładowało od nowa model i przebudowywało
+# całą bazę wektorową). Dzięki temu serwer startuje natychmiast (health
+# check na Renderze nie czeka na ciężką inicjalizację) i nie powtarza tej
+# samej pracy w kółko.
+
+_engine_singleton: Optional["ProfileAnalyzerEngine"] = None
+
+
+def get_engine(rules_db_path: str = "rules.json") -> "ProfileAnalyzerEngine":
+    global _engine_singleton
+    if _engine_singleton is None:
+        _engine_singleton = ProfileAnalyzerEngine(rules_db_path=rules_db_path)
+    return _engine_singleton
+
+
+# ---------------------------------------------------------------------------
+# 6. FORMATOWANY WYDRUK RAPORTU — bez zmian
 # ---------------------------------------------------------------------------
 
 def print_audit_report(report: ProfileAuditReport):
@@ -429,7 +401,7 @@ def print_audit_report(report: ProfileAuditReport):
 
 
 # ---------------------------------------------------------------------------
-# 5. EXECUTION
+# 7. EXECUTION
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
@@ -437,7 +409,7 @@ if __name__ == "__main__":
     REPORTS_FOLDER = Path("./audit_reports")
     REPORTS_FOLDER.mkdir(exist_ok=True)
 
-    analyzer = ProfileAnalyzerEngine(rules_db_path="rules.json")
+    analyzer = get_engine(rules_db_path="rules.json")
     extracted_files = list(EXTRACTED_FOLDER.glob("*.json"))
 
     if not extracted_files:

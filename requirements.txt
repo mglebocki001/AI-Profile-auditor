@@ -3,6 +3,5 @@ uvicorn
 python-multipart
 pydantic
 google-genai
-chromadb
 pillow
-sentence_transformers
+python-dotenv
