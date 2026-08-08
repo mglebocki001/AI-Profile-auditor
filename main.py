@@ -12,7 +12,19 @@ from fastapi.responses import HTMLResponse, JSONResponse
 from OCR import run_batch_extraction
 from Audit import get_engine  # leniwy singleton — patrz Audit.py
 from Final_Raport import generate_summary_for_reports
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 
+app = FastAPI()
+
+# Zezwól na połączenia z Twojego Reacta
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"], # Zezwala wszystkim źródłom (w tym localhost)
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 # ---------------------------------------------------------------------------
 # 1. KONFIGURACJA SERWERA & KATALOGÓW
 # ---------------------------------------------------------------------------
