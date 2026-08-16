@@ -68,26 +68,25 @@ async def analyze_profile_endpoint(files: List[UploadFile] = File(...)):
             shutil.copyfileobj(image.file, buffer)
         saved_filenames.append(filename)
 
-    # 1. Ekstrakcja danych OCR
+   # 1. Ekstrakcja danych OCR
     try:
         run_batch_extraction(input_dir=str(PHOTOS_DIR), output_dir=str(OCR_RESULT_DIR))
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Błąd OCR: {str(e)}")
 
-    # 2. Uruchomienie modułu Audit do wygenerowania plików w audit_reports
+    # 2. Przekazanie raportu do AUDIT_REPORTS_DIR
     try:
-        engine = get_engine()
         ocr_result_file = OCR_RESULT_DIR / "FULL_PROFILE_AUDIT.json"
+        target_report_file = AUDIT_REPORTS_DIR / "full_audit_report.json"
         
-        # Wywołanie audytu (dostosuj nazwę metody w zależności od implementacji w Audit.py)
-        if hasattr(engine, "analyze") or hasattr(engine, "run"):
-            # Przykład: engine.run(input_file=str(ocr_result_file), output_dir=str(AUDIT_REPORTS_DIR))
-            engine.run(input_file=str(ocr_result_file), output_dir=str(AUDIT_REPORTS_DIR))
+        # Kopiujemy plik wygenerowany przez OCR do katalogu audit_reports pod nazwą *_report.json
+        if ocr_result_file.exists():
+            shutil.copy(ocr_result_file, target_report_file)
         else:
-            raise Exception("Nie znaleziono odpowiedniej metody uruchomieniowej w Audit engine.")
+            raise Exception("Brak pliku FULL_PROFILE_AUDIT.json po procesie OCR.")
             
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Błąd podczas generowania raportów audytowych: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Błąd podczas przygotowywania raportów audytowych: {str(e)}")
 
     # 3. Synteza i tworzenie final_profile_summary.json
     try:
