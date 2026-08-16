@@ -68,24 +68,38 @@ async def analyze_profile_endpoint(files: List[UploadFile] = File(...)):
             shutil.copyfileobj(image.file, buffer)
         saved_filenames.append(filename)
 
-    # 1. Ekstrakcja danych i OCR
+    # 1. Ekstrakcja danych OCR
     try:
         run_batch_extraction(input_dir=str(PHOTOS_DIR), output_dir=str(OCR_RESULT_DIR))
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Błąd podczas ekstrakcji OCR: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Błąd OCR: {str(e)}")
 
-    # 2. Generowanie raportu końcowego
+    # 2. Uruchomienie modułu Audit do wygenerowania plików w audit_reports
+    try:
+        engine = get_engine()
+        ocr_result_file = OCR_RESULT_DIR / "FULL_PROFILE_AUDIT.json"
+        
+        # Wywołanie audytu (dostosuj nazwę metody w zależności od implementacji w Audit.py)
+        if hasattr(engine, "analyze") or hasattr(engine, "run"):
+            # Przykład: engine.run(input_file=str(ocr_result_file), output_dir=str(AUDIT_REPORTS_DIR))
+            engine.run(input_file=str(ocr_result_file), output_dir=str(AUDIT_REPORTS_DIR))
+        else:
+            raise Exception("Nie znaleziono odpowiedniej metody uruchomieniowej w Audit engine.")
+            
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Błąd podczas generowania raportów audytowych: {str(e)}")
+
+    # 3. Synteza i tworzenie final_profile_summary.json
     try:
         generate_summary_for_reports(reports_dir=str(AUDIT_REPORTS_DIR), output_dir=str(FINAL_SUMMARY_DIR))
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Błąd podczas generowania syntezy OpenAI: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Błąd podczas generowania syntezy końcowej: {str(e)}")
 
     final_file = FINAL_SUMMARY_DIR / "final_profile_summary.json"
-    
     if not final_file.exists():
         raise HTTPException(
             status_code=500, 
-            detail="Plik final_profile_summary.json nie został wygenerowany. Sprawdź logi serwera i klucz OPENAI_API_KEY."
+            detail="Plik final_profile_summary.json nie powstał. Sprawdź, czy katalog audit_reports zawiera wygenerowane pliki."
         )
 
     with open(final_file, "r", encoding="utf-8") as f:
