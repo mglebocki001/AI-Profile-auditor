@@ -29,18 +29,13 @@ OCR_RESULT_DIR = BASE_DIR / "OCR_result"
 AUDIT_REPORTS_DIR = BASE_DIR / "audit_reports"
 FINAL_SUMMARY_DIR = BASE_DIR / "final_summary"
 
-# 2. Utworzenie folderów (jeśli nie istnieją), co zapobiega błędom przy starcie
+# Tworzenie katalogów roboczych
 PHOTOS_DIR.mkdir(parents=True, exist_ok=True)
 OCR_RESULT_DIR.mkdir(parents=True, exist_ok=True)
 AUDIT_REPORTS_DIR.mkdir(parents=True, exist_ok=True)
 FINAL_SUMMARY_DIR.mkdir(parents=True, exist_ok=True)
 
-os.makedirs(PHOTOS_DIR, exist_ok=True)
-os.makedirs(OCR_RESULT_DIR, exist_ok=True)
-os.makedirs(AUDIT_REPORTS_DIR, exist_ok=True)
-os.makedirs(FINAL_SUMMARY_DIR, exist_ok=True)
-
-# Serwowanie zdjęć tymczasowych na potrzeby podglądu w interfejsie
+# Serwowanie zdjęć tymczasowych
 app.mount("/photos", StaticFiles(directory=PHOTOS_DIR), name="photos")
 
 DIRS_TO_CLEAN = [PHOTOS_DIR, OCR_RESULT_DIR, AUDIT_REPORTS_DIR, FINAL_SUMMARY_DIR]
@@ -60,7 +55,7 @@ def clean_working_directories():
 @app.post("/analyze-profile")
 async def analyze_profile_endpoint(files: List[UploadFile] = File(...)):
     if not files:
-        raise HTTPException(status_code=400, detail="Brak plików.")
+        raise HTTPException(status_code=400, detail="Brak przesłanych plików.")
 
     clean_working_directories()
 
@@ -73,10 +68,26 @@ async def analyze_profile_endpoint(files: List[UploadFile] = File(...)):
             shutil.copyfileobj(image.file, buffer)
         saved_filenames.append(filename)
 
-    run_batch_extraction(input_dir=str(PHOTOS_DIR), output_dir=str(OCR_RESULT_DIR))
-    generate_summary_for_reports(reports_dir=str(AUDIT_REPORTS_DIR), output_dir=str(FINAL_SUMMARY_DIR))
+    # 1. Ekstrakcja danych i OCR
+    try:
+        run_batch_extraction(input_dir=str(PHOTOS_DIR), output_dir=str(OCR_RESULT_DIR))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Błąd podczas ekstrakcji OCR: {str(e)}")
+
+    # 2. Generowanie raportu końcowego
+    try:
+        generate_summary_for_reports(reports_dir=str(AUDIT_REPORTS_DIR), output_dir=str(FINAL_SUMMARY_DIR))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Błąd podczas generowania syntezy OpenAI: {str(e)}")
 
     final_file = FINAL_SUMMARY_DIR / "final_profile_summary.json"
+    
+    if not final_file.exists():
+        raise HTTPException(
+            status_code=500, 
+            detail="Plik final_profile_summary.json nie został wygenerowany. Sprawdź logi serwera i klucz OPENAI_API_KEY."
+        )
+
     with open(final_file, "r", encoding="utf-8") as f:
         final_data = json.load(f)
 
@@ -93,7 +104,7 @@ def test_interface():
     <html lang="pl">
     <head>
         <meta charset="UTF-8">
-        <title>Audyt Zdjęć Profilu</title>
+        <title>Audyt Profilu - AI Dating Analyzer</title>
         <style>
             body {
                 background-color: #0d0f17;
@@ -132,8 +143,15 @@ def test_interface():
                 cursor: pointer;
                 margin-top: 15px;
             }
-            
-            /* Galeria w stylu ze zrzutu ekranu */
+
+            #loading {
+                display: none;
+                margin-top: 15px;
+                color: #eab308;
+                font-weight: 600;
+            }
+
+            /* Galeria zdjęć */
             .gallery-grid {
                 display: grid;
                 grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
@@ -153,7 +171,7 @@ def test_interface():
                 width: 100%;
                 height: 260px;
                 object-fit: cover;
-                border-radius: 12px;
+                border-radius: 12px 12px 0 0;
             }
             
             .action-status {
@@ -184,26 +202,34 @@ def test_interface():
             .tag-item.positive { color: #22c55e; }
             .tag-item.negative { color: #f43f5e; }
 
-            /* Dolna sekcja wyników */
-            .global-tags {
-                display: flex;
-                flex-wrap: wrap;
-                gap: 18px;
-                margin-bottom: 25px;
-                font-size: 14px;
-                font-weight: 600;
-            }
-            .score-card {
+            /* Sekcja szczegółów i wyników */
+            .card-panel {
                 background: #121620;
                 border: 1px solid #1e2433;
                 border-radius: 12px;
-                padding: 20px 30px;
+                padding: 24px;
+                margin-bottom: 20px;
+            }
+            .score-card {
                 display: flex;
                 justify-content: space-between;
                 align-items: center;
             }
-            .score-card .title { font-size: 16px; color: #94a3b8; font-weight: 600; }
-            .score-card .val { font-size: 28px; font-weight: 800; color: #ffffff; }
+            .score-card .title { font-size: 18px; color: #94a3b8; font-weight: 600; }
+            .score-card .val { font-size: 32px; font-weight: 800; color: #10b981; }
+
+            .section-title { font-size: 18px; color: #60a5fa; margin-bottom: 12px; font-weight: 700; }
+            .text-box { font-size: 15px; line-height: 1.6; color: #cbd5e1; }
+
+            .improvement-item {
+                background: #1a202c;
+                border-left: 4px solid #f59e0b;
+                padding: 12px 16px;
+                margin-bottom: 10px;
+                border-radius: 4px;
+            }
+            .improvement-item h4 { margin: 0 0 6px 0; color: #f3f4f6; }
+            .improvement-item p { margin: 2px 0; font-size: 13px; color: #9ca3af; }
         </style>
     </head>
     <body>
@@ -211,24 +237,49 @@ def test_interface():
     <div class="container">
         <div class="upload-box">
             <form id="auditForm">
-                <label for="fileInput" class="file-btn">📁 Wybierz zdjęcia</label>
+                <label for="fileInput" class="file-btn">📁 Wybierz zdjęcia profilu</label>
                 <input type="file" id="fileInput" multiple accept="image/*" style="display:none;">
                 <br>
                 <button type="submit" class="submit-btn" id="subBtn">Rozpocznij Analizę</button>
+                <div id="loading">⏳ Trwa analiza zdjęcia i generowanie raportu... Proszę czekać.</div>
             </form>
         </div>
 
         <div id="results" style="display:none;">
+            <!-- Ocena ogólna -->
+            <div class="card-panel score-card">
+                <div class="title">Ocena jakości profilu</div>
+                <div class="val" id="scoreVal">0/100</div>
+            </div>
+
             <!-- Siatka zdjęć ze statusami -->
             <div class="gallery-grid" id="galleryGrid"></div>
 
-            <!-- Globalne tagi pod zdjęciami -->
-            <div class="global-tags" id="globalTags"></div>
+            <!-- Podsumowanie planu działania -->
+            <div class="card-panel">
+                <div class="section-title">📋 Ogólny Plan Działania</div>
+                <div class="text-box" id="actionPlan"></div>
+            </div>
 
-            <!-- Ocena ogólna -->
-            <div class="score-card">
-                <div class="title">Ocena jakości profilu</div>
-                <div class="val" id="scoreVal">0/100</div>
+            <!-- Jedna świetna rzecz -->
+            <div class="card-panel">
+                <div class="section-title">✅ Największa Zaleta Profilu</div>
+                <div class="text-box" id="oneGreatThing"></div>
+            </div>
+
+            <!-- Sugestia Bio -->
+            <div class="card-panel">
+                <div class="section-title">✍️ Sugestia Poprawionego Bio</div>
+                <p><strong>Oryginalne Bio:</strong> <span id="origBio" style="color: #9ca3af;"></span></p>
+                <p><strong>Propozycja zmian:</strong></p>
+                <div class="text-box" id="improvedBio" style="background: #1a2332; padding: 12px; border-radius: 8px; color: #34d399;"></div>
+                <p style="font-size: 13px; color: #9ca3af; margin-top: 8px;"><strong>Dlaczego działa lepiej:</strong> <span id="whyBetterBio"></span></p>
+            </div>
+
+            <!-- Top 5 poprawek -->
+            <div class="card-panel">
+                <div class="section-title">🛠️ Top 5 Rekomendowanych Poprawek</div>
+                <div id="improvementsList"></div>
             </div>
         </div>
     </div>
@@ -236,37 +287,52 @@ def test_interface():
     <script>
         const form = document.getElementById('auditForm');
         const fileInput = document.getElementById('fileInput');
+        const loading = document.getElementById('loading');
 
         form.addEventListener('submit', async (e) => {
             e.preventDefault();
             if (!fileInput.files.length) return;
 
+            loading.style.display = 'block';
+            document.getElementById('results').style.display = 'none';
+
             const formData = new FormData();
             for (let f of fileInput.files) formData.append('files', f);
 
-            const res = await fetch('/analyze-profile', { method: 'POST', body: formData });
-            const data = await res.json();
+            try {
+                const res = await fetch('/analyze-profile', { method: 'POST', body: formData });
+                const data = await res.json();
 
-            if (data.status === 'success') {
-                renderResults(data);
+                if (res.ok && data.status === 'success') {
+                    renderResults(data);
+                } else {
+                    alert('Błąd: ' + (data.detail || 'Wystąpił błąd podczas analizy.'));
+                }
+            } catch (err) {
+                alert('Błąd połączenia z serwerem: ' + err.message);
+            } finally {
+                loading.style.display = 'none';
             }
         });
 
         function renderResults(resData) {
+            const payload = resData.data;
+
+            // Wynik punktowy
+            document.getElementById('scoreVal').innerText = `${payload.overall_score || 0}/100`;
+
+            // Karty zdjęć (photo_by_photo)
             const grid = document.getElementById('galleryGrid');
             grid.innerHTML = '';
+            const photoCards = payload.photo_by_photo || [];
 
-            const evaluations = resData.data.photo_evaluations || [];
-            const photos = resData.photos || [];
-
-            photos.forEach((photoName, idx) => {
-                const evalData = evaluations[idx] || { action: 'Zostaw', tags: [] };
-                
+            photoCards.forEach((pCard) => {
+                const photoName = resData.photos[pCard.photo_index - 1] || `photo_${pCard.photo_index}.jpg`;
                 const card = document.createElement('div');
                 card.className = 'photo-card';
 
                 let tagsHtml = '';
-                (evalData.tags || []).forEach(t => {
+                (pCard.tags || []).forEach(t => {
                     const icon = t.is_positive ? '✓' : '▲';
                     const cls = t.is_positive ? 'positive' : 'negative';
                     tagsHtml += `<div class="tag-item ${cls}">${icon} ${t.label}</div>`;
@@ -274,23 +340,36 @@ def test_interface():
 
                 card.innerHTML = `
                     <img src="/photos/${photoName}">
-                    <div class="action-status ${evalData.action}">${evalData.action}</div>
+                    <div class="action-status ${pCard.action}">${pCard.action}</div>
                     <div class="tags-list">${tagsHtml}</div>
                 `;
                 grid.appendChild(card);
             });
 
-            // Globalne tagi
-            const globalTagsDiv = document.getElementById('globalTags');
-            globalTagsDiv.innerHTML = '';
-            (resData.data.global_tags || []).forEach(t => {
-                const icon = t.is_positive ? '✓' : '▲';
-                const cls = t.is_positive ? 'positive' : 'negative';
-                globalTagsDiv.innerHTML += `<div class="tag-item ${cls}">${icon} ${t.label}</div>`;
+            // Sekcje opisu / overview
+            const overview = payload.overview || {};
+            document.getElementById('actionPlan').innerText = overview.overall_action_plan_summary || 'Brak danych';
+            document.getElementById('oneGreatThing').innerText = overview.one_great_thing || 'Brak danych';
+
+            // Bio
+            const bioData = payload.bio || {};
+            document.getElementById('origBio').innerText = bioData.original_bio || '(Brak opisu)';
+            document.getElementById('improvedBio').innerText = bioData.improved_bio || 'Nie wygenerowano propozycji.';
+            document.getElementById('whyBetterBio').innerText = bioData.why_better || '-';
+
+            // Lista Top 5 poprawek
+            const impDiv = document.getElementById('improvementsList');
+            impDiv.innerHTML = '';
+            (overview.top_5_improvements || []).forEach(item => {
+                impDiv.innerHTML += `
+                    <div class="improvement-item">
+                        <h4>${item.title}</h4>
+                        <p><strong>Dlaczego to ważne:</strong> ${item.why_it_matters}</p>
+                        <p><strong>Szybka zmiana:</strong> ${item.quick_fix}</p>
+                    </div>
+                `;
             });
 
-            // Ocena punktowa
-            document.getElementById('scoreVal').innerText = `${resData.data.overall_score}/100`;
             document.getElementById('results').style.display = 'block';
         }
     </script>
