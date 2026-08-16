@@ -2,18 +2,19 @@ import os
 import gc
 import json
 import time
+import base64
 from io import BytesIO
 from pathlib import Path
 from typing import List, Optional
 from PIL import Image
 from pydantic import BaseModel, Field
-from google import genai
-from google.genai import types
+from openai import OpenAI
 from dotenv import load_dotenv
 
 load_dotenv()
 
-API_KEY = os.getenv("GEMINI_API_KEY")
+API_KEY = os.getenv("OPENAI_API_KEY")
+MODEL_NAME = "gpt-5.6-terra"
 
 # Zdjęcia z telefonu potrafią mieć 3000-4000px i po dekompresji do surowej
 # bitmapy zajmować kilkadziesiąt MB KAŻDE (np. 4032x3024 RGB ≈ 36 MB).
@@ -73,7 +74,7 @@ class SingleProfileFullAudit(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# 2. KOMPRESJA ZDJĘĆ (nowość — kluczowa dla RAM)
+# 2. KOMPRESJA ZDJĘĆ (bez zmian — nadal kluczowa dla RAM)
 # ---------------------------------------------------------------------------
 
 def _load_compressed_jpeg_bytes(path: Path) -> Optional[bytes]:
@@ -97,17 +98,22 @@ def _load_compressed_jpeg_bytes(path: Path) -> Optional[bytes]:
 # 3. LOGIKA PRZETWARZANIA PACZKI ZDJĘĆ W JEDNYM AUDYCIE
 # ---------------------------------------------------------------------------
 
-def process_single_profile(client: genai.Client, image_paths: List[Path]) -> Optional[SingleProfileFullAudit]:
-    """Przesyła WSZYSTKIE zdjęcia jednego profilu do Gemini i zwraca JEDEN audyt.
-    Zdjęcia są kompresowane pojedynczo (nie wszystkie naraz jako pełnowymiarowe
-    obiekty PIL) — w pamięci trzymane są tylko lekkie, skompresowane bajty JPEG."""
+def process_single_profile(client: OpenAI, image_paths: List[Path]) -> Optional[SingleProfileFullAudit]:
+    """Przesyła WSZYSTKIE zdjęcia jednego profilu do GPT-5.6 Terra (Responses API,
+    wejście multimodalne) i zwraca JEDEN audyt. Zdjęcia są kompresowane pojedynczo
+    (nie wszystkie naraz jako pełnowymiarowe obiekty PIL) — w pamięci trzymane są
+    tylko lekkie, skompresowane bajty JPEG zakodowane w Base64."""
     print(f"🔄 Analizowanie pełnego profilu z {len(image_paths)} zdjęć...")
 
-    image_parts: List[types.Part] = []
+    image_parts = []
     for path in image_paths:
         jpeg_bytes = _load_compressed_jpeg_bytes(path)
         if jpeg_bytes is not None:
-            image_parts.append(types.Part.from_bytes(data=jpeg_bytes, mime_type="image/jpeg"))
+            b64_image = base64.b64encode(jpeg_bytes).decode("utf-8")
+            image_parts.append({
+                "type": "input_image",
+                "image_url": f"data:image/jpeg;base64,{b64_image}",
+            })
         del jpeg_bytes
 
     if not image_parts:
@@ -121,101 +127,41 @@ Otrzymasz ZAŁĄCZONY ZESTAW OBRAZÓW przedstawiających JEDEN PEŁNY PROFIL UŻ
 ZASADY ANALIZY:
 1. Opieraj się WYŁĄCZNIE na informacjach widocznych na obrazach. Nie zgaduj wieku, wzrostu, zawodu, majątku ani charakteru, jeśli nie wynikają z tekstu/zdjęć.
 2. Policz dokładnie wszystkie przesłane zdjęcia profilowe i zapisz ich łączną liczbę.
-3. Zanim przejdzesz do audytu, ODDZIELNIE wypisz czyste, surowe obserwacje wizualne (co dokładnie jest widoczne na każdym zdjęciu oraz CZEGO NA NIM BRAKUJE).
+3. Zanim przejdziesz do audytu, ODDZIELNIE wypisz czyste, surowe obserwacje wizualne (co dokładnie jest widoczne na każdym zdjęciu oraz CZEGO NA NIM BRAKUJE).
 4. Odróżniaj czystą obserwację (co widać / czego brakuje) od interpretacji i oceny (jaki ma to wpływ na odbiorcę).
 5. Oceniaj skuteczność profilu, jakość i odbiór – nigdy nie oceniaj atrakcyjności w sposób obraźliwy.
 6. Unikaj pustych ogólników. Każdą ocenę poprzyj konkretnym elementem obrazu, tekstu lub ich BRAKIEM.
 7. Numeruj zdjęcia zgodnie z kolejnością przesłania: Zdjęcie 1, Zdjęcie 2, Zdjęcie 3 itd.
 8. PRZEPROWADŹ KONTROLĘ BRAKÓW: Zidentyfikuj brak kluczowych elementów profilu (np. brak zdjęcia całej sylwetki, brak naturalnego uśmiechu, brak widocznych oczu przez okulary przeciwsłoneczne, brak interakcji z otoczeniem, pusty opis).
 
-WYMAGANY FORMAT WYJŚCIOWY:
-Zwróć wynik WYŁĄCZNIE w poprawnym formacie JSON.
-ZASADA KRYTYCZNA JSON: Nie umieszczaj wiszących przecinków (trailing commas) na końcu tablic ani obiektów!
-
-Struktura JSON musi wyglądać dokładnie tak:
-
-{
-  "document_title": "Audyt Profilu - [Imię/Identyfikator]",
-  "total_photos_count": 5,
-  "raw_visual_observations": [
-    {
-      "photo_number": 1,
-      "photo_type": "np. portret, selfie, cała sylwetka, zdjęcie grupowe, zdjęcie ze zwierzęciem",
-      "subject_details": "Opis widocznej osoby: płeć/wygląd, ekspozycja twarzy, oczy, fryzura, mimika (uśmiech, powaga), okulary/nakrycie głowy, pozycja ciała",
-      "clothing_and_grooming": "Szczegółowy opis ubioru, schludności, dodatków (np. czarny t-shirt, zegarek, koszula w kratę)",
-      "lighting_and_quality": "Kierunek i jakość światła, ostrość, jakość techniczna, szum, ewentualne filtry",
-      "background_and_environment": "Opis tła i otoczenia, poziom porządku/bałaganu, rozpraszające elementy",
-      "framing_and_angle": "Kadr (bliski, średni, szeroki), perspektywa, odległość od aparatu",
-      "missing_details": "Wskazanie braków na TYM konkretnym zdjęciu (np. zasłonięte oczy, brak uśmiechu, obcięta głowa, pozbawione kontekstu neutralne tło)"
-    }
-  ],
-  "profile_checklist": {
-    "has_clear_full_body_photo": true,
-    "has_clear_unobscured_face_photo": true,
-    "has_genuine_smile": false,
-    "has_hobby_or_activity_photo": false,
-    "has_filled_bio": true,
-    "critical_missing_elements": [
-      "Wymień najważniejsze elementy, których BEZWZGLĘDNIE brakuje na profilu (np. Brak zdjęcia całej sylwetki, Brak zdjęcia z pasją/aktywnością)"
-    ]
-  },
-  "raw_bio_text": "Dokładny ręczny tekst napisany przez użytkownika (zachowaj pisownię i emoji). Puste, jeśli brak.",
-  "categories_and_badges": [
-    {"category": "Wzrost", "value": "180 cm"}
-  ],
-  "interests_and_passions": ["Kawa", "Podróże"],
-  "prompts_and_answers": [
-    {"prompt": "Treść pytania", "answer": "Treść odpowiedzi"}
-  ],
-  "one_great_thing": "DOKŁADNIE JEDNA najmocniejsza zaleta ze wskazaniem źródła. Brak ogólników!",
-  "extracted_rules": [
-    {
-      "rule_name": "Krótka nazwa reguły lub krytycznego braku (np. Brak zdjęcia całej sylwetki)",
-      "section": "Kategoria (np. Liczba i Różnorodność Zdjęć, Ekspozycja Twarzy, Jakość Zdjęć, Bio)",
-      "severity": "CRITICAL / HIGH / MEDIUM / LOW",
-      "full_description": "Dokładny opis braku lub problemu na podstawie surowych danych.",
-      "what_to_look_for": ["brak_sylwetki", "okulary_sloneczne", "puste_bio"],
-      "why_it_matters": "Wyjaśnienie, dlaczego brak tego elementu budzi niepewność lub obniża atrakcyjność profilu.",
-      "quick_fix": "Instrukcja, jakie zdjęcie/tekst należy dodać, aby uzupełnić tę lukę.",
-      "positive_impact": null
-    }
-  ],
-  "summary": {
-    "photos_count_evaluation": "Ocena ilości zdjęć.",
-    "top_3_pros": ["Zaleta 1", "Zaleta 2", "Zaleta 3"],
-    "top_3_cons": ["Kluczowy brak 1", "Kluczowy brak 2", "Kluczowy brak 3"],
-    "single_biggest_improvement": "Jedna zmiana/dodatek o największym potencjale (często uzupełnienie najważniejszego braku)",
-    "recommended_photo_order": [1, 3, 2, 4],
-    "photo_action_plan": "Wskazówki, które zdjęcia usunąć, przenieść lub DODAĆ (by uzupełnić braki)."
-  }
-}
+Zwróć ustrukturyzowaną analizę zgodną z podanym schematem danych. Nie zgaduj pól, których nie da się wywnioskować z obrazów — pozostaw je puste/domyślne.
 """
 
-    contents = [*image_parts, prompt]
+    contents = [{
+        "role": "user",
+        "content": [*image_parts, {"type": "input_text", "text": prompt}],
+    }]
 
     max_retries = 3
     result: Optional[SingleProfileFullAudit] = None
     for attempt in range(max_retries):
         try:
-            response = client.models.generate_content(
-                model='gemini-3.6-flash',
-                contents=contents,
-                config=types.GenerateContentConfig(
-                    response_mime_type="application/json",
-                    response_schema=SingleProfileFullAudit,
-                    temperature=0.1
-                ),
+            response = client.responses.parse(
+                model=MODEL_NAME,
+                input=contents,
+                text_format=SingleProfileFullAudit,
+                reasoning={"effort": "low"},
             )
 
-            result = SingleProfileFullAudit.model_validate_json(response.text)
+            result = response.output_parsed
             del response
             break
 
         except Exception as e:
             error_msg = str(e)
-            if "429" in error_msg or "RESOURCE_EXHAUSTED" in error_msg:
+            if "429" in error_msg or "rate_limit" in error_msg.lower():
                 wait_time = 10
-                print(f"⏳ Limit API (429/Quota). Czekam {wait_time} s przed próbą {attempt + 1}/{max_retries}...")
+                print(f"⏳ Limit API (429/Rate limit). Czekam {wait_time} s przed próbą {attempt + 1}/{max_retries}...")
                 time.sleep(wait_time)
             else:
                 print(f"❌ Błąd podczas wywołania API dla profilu: {e}")
@@ -230,11 +176,11 @@ Struktura JSON musi wyglądać dokładnie tak:
 
 def run_batch_extraction(input_dir: str, output_dir: str):
     """Zbiera wszystkie zdjęcia z folderu i generuje z nich JEDEN plik audytu JSON."""
-    if API_KEY == "TUTAJ_WKLEJ_SWOJ_KLUCZ_API_GEMINI":
-        print("❌ BŁĄD: Musisz wkleić swój klucz API na początku pliku!")
+    if not API_KEY or API_KEY == "TUTAJ_WKLEJ_SWOJ_KLUCZ_API":
+        print("❌ BŁĄD: Musisz ustawić OPENAI_API_KEY w pliku .env!")
         return
 
-    client = genai.Client(api_key=API_KEY)
+    client = OpenAI(api_key=API_KEY)
 
     input_path = Path(input_dir)
     output_path = Path(output_dir)

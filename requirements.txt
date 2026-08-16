@@ -2,6 +2,6 @@ fastapi
 uvicorn
 python-multipart
 pydantic
-google-genai
+openai>=2.0.0
 pillow
 python-dotenv

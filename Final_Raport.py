@@ -4,13 +4,13 @@ import json
 from pathlib import Path
 from typing import Optional
 from pydantic import BaseModel, Field
-from google import genai
-from google.genai import types
+from openai import OpenAI
 from dotenv import load_dotenv
 
 load_dotenv()
 
-API_KEY = os.getenv("GEMINI_API_KEY")
+API_KEY = os.getenv("OPENAI_API_KEY")
+MODEL_NAME = "gpt-5.6-terra"
 
 
 # ---------------------------------------------------------------------------
@@ -42,11 +42,11 @@ class ProfileExecutiveSummary(BaseModel):
 # 3. SILNIK SYNTEZY RAPORTÓW
 # ---------------------------------------------------------------------------
 def generate_summary_for_reports(reports_dir: str, output_dir: str):
-    if API_KEY == "TUTAJ_WKLEJ_SWOJ_KLUCZ_API_GEMINI":
-        print("❌ BŁĄD: Podaj swój klucz API na początku pliku!")
+    if not API_KEY or API_KEY == "TUTAJ_WKLEJ_SWOJ_KLUCZ_API":
+        print("❌ BŁĄD: Ustaw OPENAI_API_KEY w pliku .env!")
         return
 
-    client = genai.Client(api_key=API_KEY)
+    client = OpenAI(api_key=API_KEY)
     reports_path = Path(reports_dir)
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
@@ -58,7 +58,7 @@ def generate_summary_for_reports(reports_dir: str, output_dir: str):
         print("ℹ️ Uruchom najpierw skrypt analyze_profile.py!")
         return
 
-    print(f"🚀 Znaleziono {len(report_files)} raportów z audytu. Generuję syntezę przez Gemini API...\n")
+    print(f"🚀 Znaleziono {len(report_files)} raportów z audytu. Generuję syntezę przez GPT-5.6 Terra...\n")
 
     combined_audits = []
     for rep in report_files:
@@ -87,17 +87,14 @@ Wymagania:
     gc.collect()
 
     try:
-        response = client.models.generate_content(
-            model='gemini-3.6-flash',
-            contents=prompt,
-            config=types.GenerateContentConfig(
-                response_mime_type="application/json",
-                response_schema=ProfileExecutiveSummary,
-                temperature=0.2,
-            ),
+        response = client.responses.parse(
+            model=MODEL_NAME,
+            input=prompt,
+            text_format=ProfileExecutiveSummary,
+            reasoning={"effort": "medium"},
         )
 
-        final_data = ProfileExecutiveSummary.model_validate_json(response.text)
+        final_data = response.output_parsed
         del response
 
         print("============================================================")
