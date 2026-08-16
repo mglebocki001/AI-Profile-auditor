@@ -24,10 +24,21 @@ app.add_middleware(
 )
 
 BASE_DIR = Path(__file__).parent
-PHOTOS_DIR = BASE_DIR / "photos"
+PHOTOS_DIR = Path("/opt/render/project/src/photos")
 OCR_RESULT_DIR = BASE_DIR / "OCR_result"
 AUDIT_REPORTS_DIR = BASE_DIR / "audit_reports"
 FINAL_SUMMARY_DIR = BASE_DIR / "final_summary"
+
+# 2. Utworzenie folderów (jeśli nie istnieją), co zapobiega błędom przy starcie
+PHOTOS_DIR.mkdir(parents=True, exist_ok=True)
+OCR_RESULT_DIR.mkdir(parents=True, exist_ok=True)
+AUDIT_REPORTS_DIR.mkdir(parents=True, exist_ok=True)
+FINAL_SUMMARY_DIR.mkdir(parents=True, exist_ok=True)
+
+os.makedirs(PHOTOS_DIR, exist_ok=True)
+os.makedirs(OCR_RESULT_DIR, exist_ok=True)
+os.makedirs(AUDIT_REPORTS_DIR, exist_ok=True)
+os.makedirs(FINAL_SUMMARY_DIR, exist_ok=True)
 
 # Serwowanie zdjęć tymczasowych na potrzeby podglądu w interfejsie
 app.mount("/photos", StaticFiles(directory=PHOTOS_DIR), name="photos")
