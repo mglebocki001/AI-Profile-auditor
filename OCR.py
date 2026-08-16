@@ -16,97 +16,107 @@ load_dotenv()
 API_KEY = os.getenv("OPENAI_API_KEY")
 MODEL_NAME = "gpt-5.6-terra"
 
-# Zdjęcia z telefonu potrafią mieć 3000-4000px i po dekompresji do surowej
-# bitmapy zajmować kilkadziesiąt MB KAŻDE (np. 4032x3024 RGB ≈ 36 MB).
-# Przy 8-10 zdjęciach jednego profilu trzymanych naraz w pamięci to już
-# 300-400 MB tylko na same bitmapy — zanim jeszcze cokolwiek wyślemy do API.
-# Zamiast tego: każde zdjęcie skalujemy i kompresujemy do JPEG w locie,
-# a surową bitmapę zwalniamy natychmiast po kompresji.
 MAX_DIMENSION = 1024
 JPEG_QUALITY = 82
 
+class PhotoTag(BaseModel):
+    label: str = Field(description="Krótka etykieta cechy np. 'Wyraźnie widoczna twarz', 'Słabe światło'.")
+    is_positive: bool = Field(description="True dla zalety, False dla wady.")
 
-# ---------------------------------------------------------------------------
-# 1. PRECYZYJNY SCHEMAT DANYCH (bez zmian)
-# ---------------------------------------------------------------------------
+class PhotoEvaluation(BaseModel):
+    photo_index: int = Field(description="Numer zdjęcia (1-based).")
+    action: str = Field(description="Rekomendacja: 'Zostaw', 'Usuń' lub 'Podobne'.")
+    tags: List[PhotoTag] = Field(description="Etykiety oceniające zdjęcie.")
 
-class ProfileBioSection(BaseModel):
-    raw_bio_text: Optional[str] = Field(
-        default=None,
-        description="Rzeczywisty opis pisany przez użytkownika (Bio/Prompt). NIE umieszczaj tu tagów ani kategorii."
-    )
-    categories_and_badges: List[str] = Field(
-        default_factory=list,
-        description="Sztywne kategorie/plakietki z interfejsu aplikacji (np. Wzrost, Zodiak, Wykształcenie, Stanowisko, Alkohol, Papierosy, Dzieci)."
-    )
-    interests_and_passions: List[str] = Field(
-        default_factory=list,
-        description="Zainteresowania, hobby, tagi i pasje wybierane z listy (np. 'Kawa', 'Muzyka', 'Podróże', 'Gym')."
-    )
+class BioAnalysis(BaseModel):
+    has_bio: bool = Field(description="Czy użytkownik posiada opis/bio.")
+    raw_bio_text: str = Field(description="Dokładna treść opisu przepisana z profilu (lub pusty string if brak).")
+    character_count: int = Field(description="Liczba znaków w opisach/bio.")
+    word_count: int = Field(description="Liczba słów w opisie.")
+    emoji_count: int = Field(description="Liczba użytych emoji.")
+    language: str = Field(description="Język opisu (np. 'pl', 'en', 'brak').")
+    bio_evaluation: str = Field(description="Ocena jakości bio np. 'Za krótki', 'Optymalny', 'Brak opisu', 'Przeładowany emoji'.")
+    bio_suggestions: List[str] = Field(description="Wskazówki jak ulepszyć opis lub co warto dodać.")
 
-class VisualRuleDetail(BaseModel):
-    rule_name: str = Field(
-        description="Nazwa wykrytej cechy wizualnej, błędu lub zalety na zdjęciach."
-    )
-    category: str = Field(
-        description="Kategoria cechy wizualnej (np. Jakość i Oświetlenie, Ekspozycja Twarzy, Mowa Ciała, Otoczenie, Sylwetka)."
-    )
-    full_description: str = Field(
-        description="Dokładny opis elementu widocznego na kadrze zdjęć."
-    )
-    what_to_look_for: List[str] = Field(
-        default_factory=list,
-        description="Detale wizualne na zdjęciu (np. 'ciemne okulary', 'bałagan w tle', 'uśmiech', 'zdjęcie w grupie')."
-    )
-    photo_index: Optional[int] = Field(
-        default=None,
-        description="Numer zdjęcia w kolejności, na którym wykryto daną cechę (np. 1, 2, 3)."
-    )
+class RawVisualObservation(BaseModel):
+    photo_number: int
+    photo_type: str
+    subject_details: str
+    clothing_and_grooming: str
+    lighting_and_quality: str
+    background_and_environment: str
+    framing_and_angle: str
+    missing_details: str
+
+class ProfileChecklist(BaseModel):
+    has_clear_full_body_photo: bool
+    has_clear_unobscured_face_photo: bool
+    has_genuine_smile: bool
+    has_hobby_or_activity_photo: bool
+    has_filled_bio: bool
+    critical_missing_elements: List[str]
+
+class CategoryBadge(BaseModel):
+    category: str
+    value: str
+
+class PromptAnswer(BaseModel):
+    prompt: str
+    answer: str
+
+class ExtractedRule(BaseModel):
+    rule_name: str
+    section: str
+    severity: str
+    full_description: str
+    what_to_look_for: List[str]
+    why_it_matters: str
+    quick_fix: str
+    positive_impact: Optional[str] = None
+
+class ProfileSummary(BaseModel):
+    photos_count_evaluation: str
+    top_3_pros: List[str]
+    top_3_cons: List[str]
+    single_biggest_improvement: str
+    recommended_photo_order: List[int]
+    photo_action_plan: str
 
 class SingleProfileFullAudit(BaseModel):
-    profile_name: str = Field(description="Imię i wiek użytkownika z profilu (np. 'Ania, 25' lub 'Nieznany').")
-    total_photos_analyzed: int = Field(description="Liczba przeanalizowanych zdjęć należących do tego profilu.")
-    one_great_thing: str = Field(
-        description="JEDNA KONKRETNA, NAJWIĘKSZA ZALETA WYKRYTA NA ZDJĘCIACH LUB W OPISIE PROFILU. Musi opisywać rzeczywisty atut wizualny lub tekstowy użytkownika."
-    )
-    profile_text_data: ProfileBioSection = Field(description="Drobiazgowo rozdzielone dane tekstowe z profilu.")
-    extracted_rules: List[VisualRuleDetail] = Field(description="Zbiorcza lista wszystkich cech wizualnych ze wszystkich zdjęć razem.")
-
-
-# ---------------------------------------------------------------------------
-# 2. KOMPRESJA ZDJĘĆ (bez zmian — nadal kluczowa dla RAM)
-# ---------------------------------------------------------------------------
+    document_title: str = Field(default="Audyt Profilu")
+    overall_score: int = Field(description="Ocena jakości profilu 0-100.")
+    total_photos_analyzed: int = Field(description="Liczba analizowanych zdjęć.")
+    photo_evaluations: List[PhotoEvaluation]
+    global_tags: List[PhotoTag]
+    bio_analysis: BioAnalysis = Field(description="Szczegółowa detekcja i analiza opisu (bio).")
+    raw_visual_observations: List[RawVisualObservation]
+    profile_checklist: ProfileChecklist
+    categories_and_badges: List[CategoryBadge]
+    interests_and_passions: List[str]
+    prompts_and_answers: List[PromptAnswer]
+    one_great_thing: str
+    extracted_rules: List[ExtractedRule]
+    summary: ProfileSummary
 
 def _load_compressed_jpeg_bytes(path: Path) -> Optional[bytes]:
-    """Otwiera zdjęcie, skaluje do max MAX_DIMENSION px i zwraca skompresowane
-    bajty JPEG. Oryginalna, surowa bitmapa jest zwalniana natychmiast po
-    wyjściu z bloku `with` — nie zostaje w pamięci."""
     try:
         with Image.open(path) as img:
             img = img.convert("RGB")
             img.thumbnail((MAX_DIMENSION, MAX_DIMENSION), Image.LANCZOS)
             buffer = BytesIO()
             img.save(buffer, format="JPEG", quality=JPEG_QUALITY, optimize=True)
-            data = buffer.getvalue()
-        return data
+            return buffer.getvalue()
     except Exception as e:
-        print(f"❌ Błąd podczas otwierania/kompresji pliku {path.name}: {e}")
+        print(f"❌ Błąd podczas przetwarzania pliku {path.name}: {e}")
         return None
 
 
-# ---------------------------------------------------------------------------
-# 3. LOGIKA PRZETWARZANIA PACZKI ZDJĘĆ W JEDNYM AUDYCIE
-# ---------------------------------------------------------------------------
-
 def process_single_profile(client: OpenAI, image_paths: List[Path]) -> Optional[SingleProfileFullAudit]:
-    """Przesyła WSZYSTKIE zdjęcia jednego profilu do GPT-5.6 Terra (Responses API,
-    wejście multimodalne) i zwraca JEDEN audyt. Zdjęcia są kompresowane pojedynczo
-    (nie wszystkie naraz jako pełnowymiarowe obiekty PIL) — w pamięci trzymane są
-    tylko lekkie, skompresowane bajty JPEG zakodowane w Base64."""
-    print(f"🔄 Analizowanie pełnego profilu z {len(image_paths)} zdjęć...")
+    print(f"🔄 Rozpoczynanie analizy dla {len(image_paths)} zdjęć...")
 
     image_parts = []
-    for path in image_paths:
+    for idx, path in enumerate(image_paths, 1):
+        print(f"   📸 Ładowanie zdjęcia {idx}/{len(image_paths)}: {path.name}")
         jpeg_bytes = _load_compressed_jpeg_bytes(path)
         if jpeg_bytes is not None:
             b64_image = base64.b64encode(jpeg_bytes).decode("utf-8")
@@ -114,9 +124,10 @@ def process_single_profile(client: OpenAI, image_paths: List[Path]) -> Optional[
                 "type": "input_image",
                 "image_url": f"data:image/jpeg;base64,{b64_image}",
             })
-        del jpeg_bytes
+            del jpeg_bytes
 
     if not image_parts:
+        print("❌ Nie udało się przetworzyć żadnego zdjęcia.")
         return None
 
     prompt = """
@@ -125,16 +136,96 @@ Jesteś profesjonalnym, wymagającym i bezstronnym audytorem profili w aplikacja
 Otrzymasz ZAŁĄCZONY ZESTAW OBRAZÓW przedstawiających JEDEN PEŁNY PROFIL UŻYTKOWNIKA. Przeanalizuj WSZYSTKIE załączone obrazy jako jedną spójną całość.
 
 ZASADY ANALIZY:
-1. Opieraj się WYŁĄCZNIE na informacjach widocznych na obrazach. Nie zgaduj wieku, wzrostu, zawodu, majątku ani charakteru, jeśli nie wynikają z tekstu/zdjęć.
-2. Policz dokładnie wszystkie przesłane zdjęcia profilowe i zapisz ich łączną liczbę.
-3. Zanim przejdziesz do audytu, ODDZIELNIE wypisz czyste, surowe obserwacje wizualne (co dokładnie jest widoczne na każdym zdjęciu oraz CZEGO NA NIM BRAKUJE).
-4. Odróżniaj czystą obserwację (co widać / czego brakuje) od interpretacji i oceny (jaki ma to wpływ na odbiorcę).
-5. Oceniaj skuteczność profilu, jakość i odbiór – nigdy nie oceniaj atrakcyjności w sposób obraźliwy.
-6. Unikaj pustych ogólników. Każdą ocenę poprzyj konkretnym elementem obrazu, tekstu lub ich BRAKIEM.
-7. Numeruj zdjęcia zgodnie z kolejnością przesłania: Zdjęcie 1, Zdjęcie 2, Zdjęcie 3 itd.
-8. PRZEPROWADŹ KONTROLĘ BRAKÓW: Zidentyfikuj brak kluczowych elementów profilu (np. brak zdjęcia całej sylwetki, brak naturalnego uśmiechu, brak widocznych oczu przez okulary przeciwsłoneczne, brak interakcji z otoczeniem, pusty opis).
+1. Opieraj się WYŁĄCZNIE na informacjach widocznych na obrazach. Nie zgaduj danych, jeśli nie wynikają z tekstu/zdjęć.
+2. Wykryj i przeanalizuj OPIS PROFILU (BIO):
+   - Odczytaj dokładną treść tekstu (raw_bio_text). Jeśli opisu brak, ustaw has_bio na false i wskaż to w opisie.
+   - Zlicz dokładnie liczbę znaków (character_count), liczbę słów (word_count) oraz użyte emoji (emoji_count).
+   - Określ język (language) oraz oszacuj jakość opisu (bio_evaluation) wraz ze wskazówkami poprawy (bio_suggestions).
+3. Przeanalizuj każde zdjęcie z osobna i przydziel mu akcję ("Zostaw", "Usuń", "Podobne") oraz odpowiednie tagi (label, is_positive).
+4. Wylicz ogólną punktację profilu w skali 0–100 (overall_score).
 
-Zwróć ustrukturyzowaną analizę zgodną z podanym schematem danych. Nie zgaduj pól, których nie da się wywnioskować z obrazów — pozostaw je puste/domyślne.
+WYMAGANY FORMAT WYJŚCIOWY (JSON):
+
+{
+  "document_title": "Audyt Profilu - [Imię/Identyfikator]",
+  "overall_score": 71,
+  "total_photos_analyzed": 5,
+  "bio_analysis": {
+    "has_bio": true,
+    "raw_bio_text": "Fani kawy i górskich wędrówek łączcie się! ☕🏔️ Szukam kogoś na niedzielny spacer i dobry sernik.",
+    "character_count": 92,
+    "word_count": 15,
+    "emoji_count": 2,
+    "language": "pl",
+    "bio_evaluation": "Optymalny, ciepły i zachęcający do interakcji",
+    "bio_suggestions": [
+      "Możesz dodać jeden konkretny luźny temat do dyskusji (np. ulubiony szlak)",
+      "Rozważ dodanie wymarzonego celu podróży"
+    ]
+  },
+  "photo_evaluations": [
+    {
+      "photo_index": 1,
+      "action": "Zostaw",
+      "tags": [
+        {"label": "Wyraźnie widoczna twarz", "is_positive": true},
+        {"label": "Słabe światło", "is_positive": false}
+      ]
+    }
+  ],
+  "global_tags": [
+    {"label": "Dobry naturalny uśmiech", "is_positive": true},
+    {"label": "Krótki, ale konkretny opis", "is_positive": true}
+  ],
+  "raw_visual_observations": [
+    {
+      "photo_number": 1,
+      "photo_type": "portret",
+      "subject_details": "Opis widocznej osoby...",
+      "clothing_and_grooming": "Opis ubioru...",
+      "lighting_and_quality": "Jakość światła...",
+      "background_and_environment": "Tło...",
+      "framing_and_angle": "Kadr...",
+      "missing_details": "Braki na zdjęciu..."
+    }
+  ],
+  "profile_checklist": {
+    "has_clear_full_body_photo": false,
+    "has_clear_unobscured_face_photo": true,
+    "has_genuine_smile": true,
+    "has_hobby_or_activity_photo": false,
+    "has_filled_bio": true,
+    "critical_missing_elements": [
+      "Brak zdjęcia całej sylwetki"
+    ]
+  },
+  "categories_and_badges": [
+    {"category": "Wzrost", "value": "180 cm"}
+  ],
+  "interests_and_passions": ["Kawa", "Góry"],
+  "prompts_and_answers": [],
+  "one_great_thing": "Bardzo naturalny uśmiech na pierwszym zdjęciu.",
+  "extracted_rules": [
+    {
+      "rule_name": "Brak zdjęcia całej sylwetki",
+      "section": "Różnorodność Zdjęć",
+      "severity": "CRITICAL",
+      "full_description": "Brak zdjęcia pokazaującego sylwetkę.",
+      "what_to_look_for": ["brak_sylwetki"],
+      "why_it_matters": "Obniża zaufanie oglądającego.",
+      "quick_fix": "Dodaj zdjęcie w pełnym kadrze.",
+      "positive_impact": "Zwiększa szansę na parę."
+    }
+  ],
+  "summary": {
+    "photos_count_evaluation": "Ocena liczby zdjęć",
+    "top_3_pros": ["Zaleta 1", "Zaleta 2", "Zaleta 3"],
+    "top_3_cons": ["Wada 1", "Wada 2", "Wada 3"],
+    "single_biggest_improvement": "Kluczowa zmiana",
+    "recommended_photo_order": [1, 2],
+    "photo_action_plan": "Plan działania dla zdjęć"
+  }
+}
 """
 
     contents = [{
@@ -142,85 +233,65 @@ Zwróć ustrukturyzowaną analizę zgodną z podanym schematem danych. Nie zgadu
         "content": [*image_parts, {"type": "input_text", "text": prompt}],
     }]
 
-    max_retries = 3
-    result: Optional[SingleProfileFullAudit] = None
-    for attempt in range(max_retries):
-        try:
-            response = client.responses.parse(
-                model=MODEL_NAME,
-                input=contents,
-                text_format=SingleProfileFullAudit,
-                reasoning={"effort": "low"},
-            )
-
-            result = response.output_parsed
-            del response
-            break
-
-        except Exception as e:
-            error_msg = str(e)
-            if "429" in error_msg or "rate_limit" in error_msg.lower():
-                wait_time = 10
-                print(f"⏳ Limit API (429/Rate limit). Czekam {wait_time} s przed próbą {attempt + 1}/{max_retries}...")
-                time.sleep(wait_time)
-            else:
-                print(f"❌ Błąd podczas wywołania API dla profilu: {e}")
-                break
-
-    # Zwalniamy skompresowane bajty obrazów i listę contents niezależnie od wyniku
-    del contents, image_parts
-    gc.collect()
-
-    return result
+    print(f"🚀 Wysyłanie zapytania do API ({MODEL_NAME})...")
+    try:
+        response = client.responses.parse(
+            model=MODEL_NAME,
+            input=contents,
+            text_format=SingleProfileFullAudit,
+            reasoning={"effort": "medium"},
+        )
+        result = response.output_parsed
+        print("✅ Pomyślnie odebrano odpowiedź z API OpenAI.")
+        del response
+        return result
+    except Exception as e:
+        print(f"❌ Błąd podczas wywołania API OpenAI: {e}")
+        return None
+    finally:
+        del contents, image_parts
+        gc.collect()
 
 
-def run_batch_extraction(input_dir: str, output_dir: str):
-    """Zbiera wszystkie zdjęcia z folderu i generuje z nich JEDEN plik audytu JSON."""
+def run_batch_extraction(input_dir: str = "./photos", output_dir: str = "./OCR_result"):
+    print("=" * 50)
+    print("🚀 Inicjalizacja skryptu OCR.py")
+    print("=" * 50)
+
     if not API_KEY or API_KEY == "TUTAJ_WKLEJ_SWOJ_KLUCZ_API":
-        print("❌ BŁĄD: Musisz ustawić OPENAI_API_KEY w pliku .env!")
+        print("❌ BŁĄD: Brak poprawnego klucza OPENAI_API_KEY w pliku .env!")
         return
-
-    client = OpenAI(api_key=API_KEY)
 
     input_path = Path(input_dir)
     output_path = Path(output_dir)
+    
+    input_path.mkdir(parents=True, exist_ok=True)
     output_path.mkdir(parents=True, exist_ok=True)
 
     supported_extensions = {".jpg", ".jpeg", ".png", ".webp"}
     images = sorted([f for f in input_path.iterdir() if f.suffix.lower() in supported_extensions])
 
     if not images:
-        print(f"⚠️ Nie znaleziono plików graficznych w katalogu: {input_path.resolve()}")
+        print(f"⚠️ Brak zdjęć w katalogu wejściowym: {input_path.resolve()}")
+        print("   Wrzuć zdjęcia (.jpg, .png, .webp) do wyżej wymienionego folderu i uruchom ponownie.")
         return
 
-    print(f"🚀 Znaleziono łącznie {len(images)} obrazów. Łączę je w JEDEN audyt profilu...\n")
+    print(f"📁 Znaleziono {len(images)} plików w katalogu {input_path.name}:")
+    for img in images:
+        print(f"   - {img.name}")
 
+    client = OpenAI(api_key=API_KEY)
     result = process_single_profile(client, images)
 
     if result:
         output_file = output_path / "FULL_PROFILE_AUDIT.json"
-
         with open(output_file, "w", encoding="utf-8") as f:
             f.write(result.model_dump_json(indent=2))
-
-        print("="*65)
-        print("✅ GENIALNIE! Wygenerowano JEDEN skumulowany raport audytu.")
-        print(f"📁 Plik zapisano w: {output_file.name}")
-        print(f"👤 Wykryty profil: {result.profile_name}")
-        print(f"🌟 Główna zaleta profilu: {result.one_great_thing}")
-        print(f"📝 Długość opisu (Bio): {len(result.profile_text_data.raw_bio_text or '')} znaków")
-        print(f"🏷️ Wykryte kategorie systemowe: {len(result.profile_text_data.categories_and_badges)}")
-        print(f"🎯 Wykryte zainteresowania: {len(result.profile_text_data.interests_and_passions)}")
-        print(f"🔍 Wszystkich zebranych reguł wizualnych: {len(result.extracted_rules)}")
-        print("="*65 + "\n")
+        print(f"🎉 Sukces! Wynik zapisano w pliku: {output_file.resolve()}")
 
     del client
     gc.collect()
 
 
 if __name__ == "__main__":
-    INPUT_FOLDER = "./photos"       # Włóż tutaj WSZYSTKIE zdjęcia danego profilu
-    OUTPUT_FOLDER = "./OCR_result"   # Tu powstanie JEDEN plik FULL_PROFILE_AUDIT.json
-
-    os.makedirs(INPUT_FOLDER, exist_ok=True)
-    run_batch_extraction(INPUT_FOLDER, OUTPUT_FOLDER)
+    run_batch_extraction()

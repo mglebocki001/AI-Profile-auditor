@@ -7,32 +7,13 @@ from typing import List
 from fastapi import FastAPI, UploadFile, File, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
 
-# Importy logiki z Twoich skryptów
 from OCR import run_batch_extraction
-from Audit import get_engine  # leniwy singleton — patrz Audit.py
+from Audit import get_engine
 from Final_Raport import generate_summary_for_reports
-from fastapi import FastAPI
-from fastapi.middleware.cors import CORSMiddleware
 
-app = FastAPI()
-
-# Zezwól na połączenia z Twojego Reacta
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"], # Zezwala wszystkim źródłom (w tym localhost)
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-# ---------------------------------------------------------------------------
-# 1. KONFIGURACJA SERWERA & KATALOGÓW
-# ---------------------------------------------------------------------------
-app = FastAPI(
-    title="AI Dating Profile Analyzer API",
-    description="Automatyczny audyt profili randkowych z użyciem Gemini Vision & Pydantic",
-    version="1.0.0"
-)
+app = FastAPI(title="AI Dating Profile Analyzer API")
 
 app.add_middleware(
     CORSMiddleware,
@@ -48,14 +29,12 @@ OCR_RESULT_DIR = BASE_DIR / "OCR_result"
 AUDIT_REPORTS_DIR = BASE_DIR / "audit_reports"
 FINAL_SUMMARY_DIR = BASE_DIR / "final_summary"
 
+# Serwowanie zdjęć tymczasowych na potrzeby podglądu w interfejsie
+app.mount("/photos", StaticFiles(directory=PHOTOS_DIR), name="photos")
+
 DIRS_TO_CLEAN = [PHOTOS_DIR, OCR_RESULT_DIR, AUDIT_REPORTS_DIR, FINAL_SUMMARY_DIR]
 
-
-# ---------------------------------------------------------------------------
-# 2. HELPER: CZYSZCZENIE KATALOGÓW ROBOCZYCH
-# ---------------------------------------------------------------------------
 def clean_working_directories():
-    """Usuwa stare pliki z poprzednich zapytań, aby zapobiec nakładaniu się wyników."""
     for folder in DIRS_TO_CLEAN:
         folder.mkdir(parents=True, exist_ok=True)
         for item in folder.iterdir():
@@ -66,120 +45,36 @@ def clean_working_directories():
                     shutil.rmtree(item)
             except Exception as e:
                 print(f"⚠️ Nie udało się usunąć {item}: {e}")
-    print("🧹 Wyczyszczono katalogi robocze z poprzednich zapytań.")
 
-
-# ---------------------------------------------------------------------------
-# 2b. GLOBALNY HANDLER WYJĄTKÓW (siatka bezpieczeństwa)
-# ---------------------------------------------------------------------------
-# UWAGA: to zabezpiecza przed niezłapanymi wyjątkami Pythona (np. bug w
-# kodzie) — zwraca czysty JSON 500 zamiast crashować worker Uvicorna.
-# NIE naprawia to samo w sobie zabicia procesu przez system operacyjny
-# z powodu przekroczenia limitu RAM (OOM-kill) — to sygnał SIGKILL, na
-# który żaden handler w Pythonie nie zdąży zareagować. Objaw "Unexpected
-# end of JSON input" po stronie klienta jest typowym śladem właśnie OOM-
-# killa w trakcie generowania odpowiedzi — dlatego kluczowe są zmiany w
-# Audit.py/OCR.py, które faktycznie obniżają szczytowe zużycie RAM.
-@app.exception_handler(Exception)
-async def unhandled_exception_handler(request: Request, exc: Exception):
-    gc.collect()
-    return JSONResponse(
-        status_code=500,
-        content={"status": "error", "detail": f"Nieoczekiwany błąd serwera: {str(exc)}"},
-    )
-
-
-# ---------------------------------------------------------------------------
-# 3. ENDPOINT API DO ANALIZY
-# ---------------------------------------------------------------------------
 @app.post("/analyze-profile")
-async def analyze_profile_endpoint(
-    files: List[UploadFile] = File(...)
-):
+async def analyze_profile_endpoint(files: List[UploadFile] = File(...)):
     if not files:
-        raise HTTPException(status_code=400, detail="Brak przesłanych plików obrazów.")
+        raise HTTPException(status_code=400, detail="Brak plików.")
 
-    # Krok 0: Czyszczenie środowiska
     clean_working_directories()
 
-    # Krok 1: Zapisanie przesłanych obrazów do folderu ./photos
-    saved_file_paths = []
-    for image in files:
-        file_path = PHOTOS_DIR / image.filename
+    saved_filenames = []
+    for idx, image in enumerate(files):
+        ext = Path(image.filename).suffix or ".jpg"
+        filename = f"photo_{idx+1}{ext}"
+        file_path = PHOTOS_DIR / filename
         with open(file_path, "wb") as buffer:
             shutil.copyfileobj(image.file, buffer)
-        saved_file_paths.append(file_path)
+        saved_filenames.append(filename)
 
-    print(f"📥 Zapisano {len(saved_file_paths)} obrazów w folderze ./photos")
+    run_batch_extraction(input_dir=str(PHOTOS_DIR), output_dir=str(OCR_RESULT_DIR))
+    generate_summary_for_reports(reports_dir=str(AUDIT_REPORTS_DIR), output_dir=str(FINAL_SUMMARY_DIR))
 
-    del files
-    gc.collect()
+    final_file = FINAL_SUMMARY_DIR / "final_profile_summary.json"
+    with open(final_file, "r", encoding="utf-8") as f:
+        final_data = json.load(f)
 
-    # Krok 2: Uruchomienie OCR (Gemini Vision API - Zbiorcza analiza w 1 pliku)
-    try:
-        run_batch_extraction(input_dir=str(PHOTOS_DIR), output_dir=str(OCR_RESULT_DIR))
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Błąd podczas ekstrakcji OCR: {str(e)}")
-    finally:
-        gc.collect()
+    return {
+        "status": "success",
+        "photos": saved_filenames,
+        "data": final_data
+    }
 
-    # Krok 3: Uruchomienie silnika audytu (Audit vs rules.json)
-    # Silnik jest leniwym singletonem (get_engine) — indeks reguł budowany
-    # jest RAZ dla całego procesu, a nie od nowa przy każdym zapytaniu.
-    try:
-        analyzer = get_engine(rules_db_path="rules.json")
-        ocr_files = list(OCR_RESULT_DIR.glob("*.json"))
-
-        if not ocr_files:
-            raise HTTPException(status_code=422, detail="Model Vision AI nie wyekstrahował danych z podanych obrazów.")
-
-        for file in ocr_files:
-            audit = analyzer.analyze_extracted_json(str(file))
-            out_file = AUDIT_REPORTS_DIR / f"{file.stem}_audit_report.json"
-            with open(out_file, "w", encoding="utf-8") as f:
-                f.write(audit.model_dump_json(indent=2))
-            del audit
-
-        del ocr_files
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Błąd podczas audytu reguł: {str(e)}")
-    finally:
-        gc.collect()
-
-    # Krok 4: Generowanie końcowego raportu podsumowującego
-    try:
-        generate_summary_for_reports(
-            reports_dir=str(AUDIT_REPORTS_DIR),
-            output_dir=str(FINAL_SUMMARY_DIR)
-        )
-
-        final_file = FINAL_SUMMARY_DIR / "final_profile_summary.json"
-
-        if not final_file.exists():
-            raise HTTPException(status_code=500, detail="Błąd: Plik finalnego raportu nie został utworzony.")
-
-        with open(final_file, "r", encoding="utf-8") as f:
-            final_data = json.load(f)
-
-        return {
-            "status": "success",
-            "message": "Profil został pomyślnie przeanalizowany.",
-            "data": final_data
-        }
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Błąd podczas generowania finalnego raportu: {str(e)}")
-    finally:
-        gc.collect()
-
-
-# ---------------------------------------------------------------------------
-# 4. NOWOCZESNY INTERFEJS GRAFICZNY Z PODGLĄDEM ZDJĘĆ
-# ---------------------------------------------------------------------------
 @app.get("/test", response_class=HTMLResponse)
 def test_interface():
     return """
@@ -187,443 +82,207 @@ def test_interface():
     <html lang="pl">
     <head>
         <meta charset="UTF-8">
-        <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>AI Dating Profile Audit</title>
+        <title>Audyt Zdjęć Profilu</title>
         <style>
-            :root {
-                --bg-color: #0f172a;
-                --card-bg: #1e293b;
-                --text-main: #f8fafc;
-                --text-muted: #94a3b8;
-                --accent-green: #10b981;
-                --accent-red: #f43f5e;
-                --accent-blue: #3b82f6;
-                --border-color: #334155;
-            }
-
             body {
-                font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
-                background-color: var(--bg-color);
-                color: var(--text-main);
+                background-color: #0d0f17;
+                color: #ffffff;
+                font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
                 margin: 0;
-                padding: 20px;
+                padding: 40px 20px;
                 display: flex;
                 justify-content: center;
             }
-
-            .container {
-                width: 100%;
-                max-width: 680px;
-            }
-
-            .header {
-                text-align: center;
-                margin-bottom: 25px;
-            }
-
-            .header h1 {
-                font-size: 26px;
-                font-weight: 800;
-                margin-bottom: 8px;
-                background: linear-gradient(135deg, #a855f7, #ec4899);
-                -webkit-background-clip: text;
-                -webkit-text-fill-color: transparent;
-            }
-
-            .header p {
-                color: var(--text-muted);
-                font-size: 14px;
-                margin: 0;
-            }
-
-            .upload-card {
-                background: var(--card-bg);
-                border: 2px dashed var(--border-color);
+            .container { width: 100%; max-width: 1100px; }
+            
+            .upload-box {
+                background: #161a23;
+                border: 2px dashed #2a3142;
                 border-radius: 12px;
-                padding: 25px;
+                padding: 30px;
                 text-align: center;
-                margin-bottom: 25px;
+                margin-bottom: 30px;
             }
-
-            .upload-card:hover {
-                border-color: #6366f1;
-            }
-
-            input[type="file"] {
-                display: none;
-            }
-
-            .file-label {
-                display: inline-block;
+            .file-btn {
+                background: #2563eb;
+                color: #fff;
                 padding: 10px 20px;
-                background: #334155;
-                color: white;
                 border-radius: 8px;
                 cursor: pointer;
-                font-weight: 500;
-                font-size: 14px;
-                margin-bottom: 15px;
+                display: inline-block;
             }
-
-            .file-label:hover {
-                background: #475569;
-            }
-
-            /* Galeria miniaturek */
-            .preview-grid {
-                display: grid;
-                grid-template-columns: repeat(auto-fill, minmax(90px, 1fr));
-                gap: 12px;
-                margin-bottom: 20px;
-            }
-
-            .preview-item {
-                position: relative;
-                width: 100%;
-                padding-top: 133%; /* Proporcje ok. 3:4 dla zdjęć profilowych */
-                border-radius: 8px;
-                overflow: hidden;
-                background: #0f172a;
-                border: 1px solid var(--border-color);
-            }
-
-            .preview-item img {
-                position: absolute;
-                top: 0;
-                left: 0;
-                width: 100%;
-                height: 100%;
-                object-fit: cover;
-            }
-
-            .remove-btn {
-                position: absolute;
-                top: 4px;
-                right: 4px;
-                background: rgba(15, 23, 42, 0.75);
-                color: #f43f5e;
+            .submit-btn {
+                background: #10b981;
+                color: #fff;
                 border: none;
-                border-radius: 50%;
-                width: 22px;
-                height: 22px;
-                font-size: 12px;
-                font-weight: bold;
+                padding: 10px 24px;
+                border-radius: 8px;
+                font-size: 16px;
                 cursor: pointer;
+                margin-top: 15px;
+            }
+            
+            /* Galeria w stylu ze zrzutu ekranu */
+            .gallery-grid {
+                display: grid;
+                grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
+                gap: 16px;
+                margin-bottom: 30px;
+            }
+            .photo-card {
+                background: #121620;
+                border-radius: 14px;
+                overflow: hidden;
+                display: flex;
+                flex-direction: column;
+                align-items: center;
+                padding-bottom: 12px;
+            }
+            .photo-card img {
+                width: 100%;
+                height: 260px;
+                object-fit: cover;
+                border-radius: 12px;
+            }
+            
+            .action-status {
+                margin-top: 12px;
+                font-weight: 700;
+                font-size: 15px;
+            }
+            .action-status.Zostaw { color: #22c55e; }
+            .action-status.Usuń { color: #f43f5e; }
+            .action-status.Podobne { color: #eab308; }
+
+            .tags-list {
+                margin-top: 10px;
+                display: flex;
+                flex-direction: column;
+                gap: 6px;
+                padding: 0 10px;
+                width: 100%;
+                box-sizing: border-box;
+            }
+            .tag-item {
+                font-size: 12px;
+                font-weight: 600;
                 display: flex;
                 align-items: center;
-                justify-content: center;
-                line-height: 1;
+                gap: 5px;
             }
+            .tag-item.positive { color: #22c55e; }
+            .tag-item.negative { color: #f43f5e; }
 
-            .remove-btn:hover {
-                background: #f43f5e;
-                color: white;
-            }
-
-            .submit-btn {
-                width: 100%;
-                padding: 12px;
-                background: linear-gradient(135deg, #6366f1, #8b5cf6);
-                color: white;
-                border: none;
-                border-radius: 8px;
-                font-size: 16px;
-                font-weight: 600;
-                cursor: pointer;
-            }
-
-            .submit-btn:disabled {
-                background: #475569;
-                cursor: not-allowed;
-            }
-
-            .loader {
-                display: none;
-                text-align: center;
-                padding: 30px;
-            }
-
-            .spinner {
-                width: 40px;
-                height: 40px;
-                border: 4px solid rgba(255,255,255,0.1);
-                border-top: 4px solid #6366f1;
-                border-radius: 50%;
-                animation: spin 1s linear infinite;
-                margin: 0 auto 15px auto;
-            }
-
-            @keyframes spin {
-                0% { transform: rotate(0deg); }
-                100% { transform: rotate(360deg); }
-            }
-
-            .results-section {
-                display: none;
-            }
-
-            .section-title {
-                font-size: 13px;
-                text-transform: uppercase;
-                letter-spacing: 1px;
-                color: var(--text-muted);
-                margin-bottom: 12px;
-                font-weight: 700;
-            }
-
-            .card {
-                background: var(--card-bg);
-                border-radius: 12px;
-                padding: 18px;
-                margin-bottom: 15px;
-                border-left: 5px solid;
+            /* Dolna sekcja wyników */
+            .global-tags {
                 display: flex;
-                gap: 15px;
-                align-items: flex-start;
-            }
-
-            .card.summary {
-                border-color: var(--accent-blue);
-                background: rgba(59, 130, 246, 0.08);
-            }
-
-            .card.great {
-                border-color: var(--accent-green);
-                background: rgba(16, 185, 129, 0.08);
-            }
-
-            .card.improvement {
-                border-color: var(--accent-red);
-                background: rgba(244, 63, 94, 0.08);
-            }
-
-            .icon {
-                font-size: 22px;
-                line-height: 1;
-                margin-top: 2px;
-            }
-
-            .card-content {
-                flex: 1;
-            }
-
-            .card-title {
-                font-weight: 700;
-                font-size: 16px;
-                margin-bottom: 6px;
-            }
-
-            .summary .card-title {
-                color: var(--accent-blue);
-            }
-
-            .great .card-title {
-                color: var(--accent-green);
-            }
-
-            .improvement .card-title {
-                color: var(--accent-red);
-            }
-
-            .card-text {
+                flex-wrap: wrap;
+                gap: 18px;
+                margin-bottom: 25px;
                 font-size: 14px;
-                color: #cbd5e1;
-                line-height: 1.5;
-                margin-bottom: 6px;
-            }
-
-            .quick-fix {
-                font-size: 13px;
-                color: #f1f5f9;
-                background: rgba(255, 255, 255, 0.06);
-                padding: 8px 12px;
-                border-radius: 6px;
-                margin-top: 8px;
-            }
-
-            .quick-fix-tag {
                 font-weight: 600;
-                color: #fbbf24;
             }
+            .score-card {
+                background: #121620;
+                border: 1px solid #1e2433;
+                border-radius: 12px;
+                padding: 20px 30px;
+                display: flex;
+                justify-content: space-between;
+                align-items: center;
+            }
+            .score-card .title { font-size: 16px; color: #94a3b8; font-weight: 600; }
+            .score-card .val { font-size: 28px; font-weight: 800; color: #ffffff; }
         </style>
     </head>
     <body>
 
     <div class="container">
-        <div class="header">
-            <h1>Audyt Profilu Randkowego</h1>
-            <p>Szybki raport jakości Twoich zdjęć oraz opisu</p>
-        </div>
-
-        <div class="upload-card">
+        <div class="upload-box">
             <form id="auditForm">
-                <label for="fileInput" class="file-label">📁 Wybierz zdjęcia profilu</label>
-                <input type="file" id="fileInput" name="files" multiple accept="image/*">
-                
-                <!-- Siatka na miniaturki podglądu -->
-                <div class="preview-grid" id="previewGrid"></div>
-
-                <button type="submit" class="submit-btn" id="submitBtn" disabled>Rozpocznij Audyt</button>
+                <label for="fileInput" class="file-btn">📁 Wybierz zdjęcia</label>
+                <input type="file" id="fileInput" multiple accept="image/*" style="display:none;">
+                <br>
+                <button type="submit" class="submit-btn" id="subBtn">Rozpocznij Analizę</button>
             </form>
         </div>
 
-        <div class="loader" id="loader">
-            <div class="spinner"></div>
-            <p style="color: var(--text-muted); font-size: 14px;">Generowanie raportu przez AI...</p>
-        </div>
+        <div id="results" style="display:none;">
+            <!-- Siatka zdjęć ze statusami -->
+            <div class="gallery-grid" id="galleryGrid"></div>
 
-        <div class="results-section" id="results">
-            <!-- 0. OGÓLNE PODSUMOWANIE PROFILU -->
-            <div class="section-title">Ogólny plan działania</div>
-            <div class="card summary">
-                <div class="icon">📌</div>
-                <div class="card-content">
-                    <div class="card-title">Podsumowanie audytu</div>
-                    <div class="card-text" id="summary-text"></div>
-                </div>
+            <!-- Globalne tagi pod zdjęciami -->
+            <div class="global-tags" id="globalTags"></div>
+
+            <!-- Ocena ogólna -->
+            <div class="score-card">
+                <div class="title">Ocena jakości profilu</div>
+                <div class="val" id="scoreVal">0/100</div>
             </div>
-
-            <!-- 1. ZIELONY PTASZEK (ZALETA) -->
-            <div class="section-title" style="margin-top: 25px;">Co masz zrobione świetnie</div>
-            <div class="card great">
-                <div class="icon">✅</div>
-                <div class="card-content">
-                    <div class="card-title">Mocna strona profilu</div>
-                    <div class="card-text" id="great-thing-text"></div>
-                </div>
-            </div>
-
-            <!-- 2. BŁĘDY DO POPRAWY -->
-            <div class="section-title" style="margin-top: 25px;">Kluczowe punkty do poprawy</div>
-            <div id="improvements-list"></div>
         </div>
     </div>
 
     <script>
-        const fileInput = document.getElementById('fileInput');
-        const previewGrid = document.getElementById('previewGrid');
         const form = document.getElementById('auditForm');
-        const loader = document.getElementById('loader');
-        const results = document.getElementById('results');
-        const submitBtn = document.getElementById('submitBtn');
-
-        let selectedFiles = [];
-
-        fileInput.addEventListener('change', (e) => {
-            const newFiles = Array.from(e.target.files);
-            selectedFiles = [...selectedFiles, ...newFiles];
-            updatePreview();
-            fileInput.value = ''; // Resetujemy input, aby można było dodawać pliki partiami
-        });
-
-        function updatePreview() {
-            previewGrid.innerHTML = '';
-            
-            if (selectedFiles.length > 0) {
-                submitBtn.disabled = false;
-            } else {
-                submitBtn.disabled = true;
-            }
-
-            selectedFiles.forEach((file, index) => {
-                const reader = new FileReader();
-                reader.onload = (e) => {
-                    const item = document.createElement('div');
-                    item.className = 'preview-item';
-                    item.innerHTML = `
-                        <img src="${e.target.result}" alt="Podgląd">
-                        <button type="button" class="remove-btn" onclick="removeFile(${index})">✕</button>
-                    `;
-                    previewGrid.appendChild(item);
-                };
-                reader.readAsDataURL(file);
-            });
-        }
-
-        function removeFile(index) {
-            selectedFiles.splice(index, 1);
-            updatePreview();
-        }
+        const fileInput = document.getElementById('fileInput');
 
         form.addEventListener('submit', async (e) => {
             e.preventDefault();
-            if (selectedFiles.length === 0) return;
-
-            loader.style.display = 'block';
-            results.style.display = 'none';
-            submitBtn.disabled = true;
+            if (!fileInput.files.length) return;
 
             const formData = new FormData();
-            selectedFiles.forEach((file) => {
-                formData.append('files', file);
-            });
+            for (let f of fileInput.files) formData.append('files', f);
 
-            try {
-                const response = await fetch('/analyze-profile', {
-                    method: 'POST',
-                    body: formData
-                });
+            const res = await fetch('/analyze-profile', { method: 'POST', body: formData });
+            const data = await res.json();
 
-                const res = await response.json();
-
-                if (res.status === 'success' && res.data) {
-                    renderResults(res.data);
-                } else {
-                    alert('Błąd podczas analizy: ' + (res.detail || 'Nieznany błąd'));
-                }
-            } catch (err) {
-                alert('Wystąpił błąd połączenia z serwerem: ' + err);
-            } finally {
-                loader.style.display = 'none';
-                submitBtn.disabled = false;
+            if (data.status === 'success') {
+                renderResults(data);
             }
         });
 
-        function renderResults(data) {
-            // 0. Ogólne Podsumowanie
-            document.getElementById('summary-text').innerText = data.overall_action_plan_summary || 'Brak ogólnego podsumowania.';
+        function renderResults(resData) {
+            const grid = document.getElementById('galleryGrid');
+            grid.innerHTML = '';
 
-            // 1. Ptaszek (Zielony)
-            document.getElementById('great-thing-text').innerText = data.one_great_thing || 'Twój profil ma dobre podstawy.';
+            const evaluations = resData.data.photo_evaluations || [];
+            const photos = resData.photos || [];
 
-            // 2. Poprawki (Czerwone błędy)
-            const listContainer = document.getElementById('improvements-list');
-            listContainer.innerHTML = '';
-
-            const improvements = data.top_5_improvements || [];
-
-            improvements.forEach((item, index) => {
+            photos.forEach((photoName, idx) => {
+                const evalData = evaluations[idx] || { action: 'Zostaw', tags: [] };
+                
                 const card = document.createElement('div');
-                card.className = 'card improvement';
+                card.className = 'photo-card';
+
+                let tagsHtml = '';
+                (evalData.tags || []).forEach(t => {
+                    const icon = t.is_positive ? '✓' : '▲';
+                    const cls = t.is_positive ? 'positive' : 'negative';
+                    tagsHtml += `<div class="tag-item ${cls}">${icon} ${t.label}</div>`;
+                });
 
                 card.innerHTML = `
-                    <div class="icon">❌</div>
-                    <div class="card-content">
-                        <div class="card-title">${index + 1}. ${escapeHtml(item.title)}</div>
-                        <div class="card-text">${escapeHtml(item.why_it_matters)}</div>
-                        <div class="quick-fix">
-                            <span class="quick-fix-tag">💡 Rozwiązanie:</span> ${escapeHtml(item.quick_fix)}
-                        </div>
-                    </div>
+                    <img src="/photos/${photoName}">
+                    <div class="action-status ${evalData.action}">${evalData.action}</div>
+                    <div class="tags-list">${tagsHtml}</div>
                 `;
-
-                listContainer.appendChild(card);
+                grid.appendChild(card);
             });
 
-            results.style.display = 'block';
-        }
+            // Globalne tagi
+            const globalTagsDiv = document.getElementById('globalTags');
+            globalTagsDiv.innerHTML = '';
+            (resData.data.global_tags || []).forEach(t => {
+                const icon = t.is_positive ? '✓' : '▲';
+                const cls = t.is_positive ? 'positive' : 'negative';
+                globalTagsDiv.innerHTML += `<div class="tag-item ${cls}">${icon} ${t.label}</div>`;
+            });
 
-        function escapeHtml(str) {
-            if (!str) return '';
-            return str.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+            // Ocena punktowa
+            document.getElementById('scoreVal').innerText = `${resData.data.overall_score}/100`;
+            document.getElementById('results').style.display = 'block';
         }
     </script>
-
     </body>
     </html>
     """
-
-
-@app.get("/")
-def health_check():
-    return {"status": "ok", "service": "Dating Profile AI Analyzer"}

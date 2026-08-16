@@ -8,8 +8,14 @@ from typing import List, Dict, Any, Optional
 from pydantic import BaseModel
 
 # ---------------------------------------------------------------------------
-# 1. STRUKTURA RAPORTU AUDYTU (Pydantic Schema) — bez zmian
+# 1. STRUKTURA RAPORTU AUDYTU (Pydantic Schema)
 # ---------------------------------------------------------------------------
+# ZMIANA: raport teraz PRZENOSI (pass-through) bogate dane per-zdjęcie i
+# per-bio wygenerowane już przez OCR/Vision (photo_evaluations, bio_analysis,
+# global_tags, profile_summary) — wcześniej były one wczytywane z pliku
+# wejściowego, ale NIGDZIE nie trafiały do wyniku audytu, więc ginęły po
+# drodze do Final_Raport.py i finalnie na stronie. Same modele reguł
+# (AuditIssue) i logika dopasowywania RAG — bez zmian.
 
 class AuditIssue(BaseModel):
     section: str
@@ -22,13 +28,61 @@ class AuditIssue(BaseModel):
     relevance_score: float = 0.0
     matched_by_keywords: bool = False
 
+
+class PhotoTag(BaseModel):
+    label: str
+    is_positive: bool
+
+
+class PhotoEvaluation(BaseModel):
+    photo_index: int
+    action: str  # "Zostaw" / "Usuń" / "Podobne"
+    tags: List[PhotoTag] = []
+
+
+class BioAnalysis(BaseModel):
+    has_bio: bool = False
+    raw_bio_text: Optional[str] = None
+    language: Optional[str] = None
+    word_count: int = 0
+    bio_evaluation: Optional[str] = None
+    bio_suggestions: List[str] = []
+
+
+class ProfileSummaryBlock(BaseModel):
+    photos_count_evaluation: Optional[str] = None
+    top_3_pros: List[str] = []
+    top_3_cons: List[str] = []
+    single_biggest_improvement: Optional[str] = None
+    recommended_photo_order: List[int] = []
+    photo_action_plan: Optional[str] = None
+
+
 class ProfileAuditReport(BaseModel):
     profile_name: str
+    total_photos_analyzed: int = 0
+
+    # Dwa niezależne wyniki + jeden łączny pokazywany użytkownikowi:
+    # - photo_overall_score: ocena wystawiona bezpośrednio przez model Vision
+    #   (całościowa jakość zdjęć/profilu, z pliku wejściowego OCR).
+    # - rules_overall_score: wynik NASZEGO silnika RAG, liczony z wagi
+    #   dopasowanych reguł z rules.json (logika bez zmian, jak dotychczas).
+    # - overall_score: średnia obu, żeby front miał JEDNĄ liczbę do pokazania.
+    photo_overall_score: Optional[float] = None
+    rules_overall_score: float = 0.0
+    overall_score: float = 0.0
+
     total_issues: int
     critical_issues_count: int
-    overall_score: float
     detected_issues: List[AuditIssue]
     positive_highlights: List[str]
+
+    # NOWE — dane per-zdjęcie i per-bio, przeniesione 1:1 z wejściowego JSON-a,
+    # bez dodatkowego przetwarzania (to już gotowe, ocenione dane z Vision AI).
+    photo_evaluations: List[PhotoEvaluation] = []
+    global_tags: List[PhotoTag] = []
+    bio_analysis: Optional[BioAnalysis] = None
+    profile_summary: Optional[ProfileSummaryBlock] = None
 
 
 # ---------------------------------------------------------------------------
@@ -64,22 +118,12 @@ def _keyword_overlap_score(query_text: str, trigger_keywords_joined: str) -> flo
 # ---------------------------------------------------------------------------
 # 3. LEKKI INDEKS TF-IDF (ZASTĘPUJE ChromaDB + sentence-transformers/PyTorch)
 # ---------------------------------------------------------------------------
-#
-# UWAGA DOT. JAKOŚCI DOPASOWANIA (świadomy kompromis RAM vs jakość):
-# Poprzedni silnik używał modelu "paraphrase-multilingual-mpnet-base-v2"
-# (transformer, setki MB parametrów + PyTorch w RAM), który dobrze radzi
-# sobie z parafrazami ("brak uśmiechu" ~ "poważna mina"). TF-IDF jest
-# metodą LEKSYKALNĄ — dobrze łapie dosłowne/pokrewne słowa, gorzej czyste
-# parafrazy bez wspólnych rdzeni słów. Dlatego próg trafności i wagi
-# poniżej są przeliczone tak, by silniej opierać się na sygnale keyword
-# (Audit.py i tak już miał "kotwicę" słów kluczowych na wypadek słabego
-# embeddingu — tutaj ta kotwica dźwiga więcej). Jeśli po testach na
-# realnych danych jakość dopasowań okaże się niewystarczająca, zalecany
-# upgrade to embeddingi przez Gemini API (`client.models.embed_content`)
-# zamiast lokalnego modelu — to nadal nie obciąża RAM-u serwera, bo
-# liczenie odbywa się zdalnie, a tutaj trzeba by tylko cache'ować wektory
-# na dysku. Nie wdrożyłem tego domyślnie, żeby nie dodawać zależności
-# sieciowej do KAŻDEGO zapytania audytu bez Twojej zgody.
+# UWAGA DOT. RENDER 500MB RAM: ten indeks jest stdlib-only (math/re/Counter),
+# dla ~600 krótkich dokumentów reguł zajmuje pojedyncze MB. Zmiany w tym
+# pliku (pass-through photo_evaluations/bio_analysis/summary) NIE dokładają
+# żadnej nowej zależności ani modelu — to tylko przepisanie już wczytanego,
+# małego (KB) słownika Pythona do pól Pydantic. Budżet RAM pozostaje
+# praktycznie identyczny jak przed zmianą.
 
 _TOKEN_RE = re.compile(r"[a-ząćęłńóśźżA-ZĄĆĘŁŃÓŚŹŻ0-9]+")
 
@@ -152,7 +196,7 @@ class _TfidfIndex:
 
 # ---------------------------------------------------------------------------
 # 4. SILNIK AUDYTU (interfejs publiczny bez zmian — analyze_extracted_json
-#    ma dokładnie ten sam kontrakt co poprzednio)
+#    ma dokładnie ten sam kontrakt co poprzednio, plus bogatszy wynik)
 # ---------------------------------------------------------------------------
 
 class ProfileAnalyzerEngine:
@@ -255,6 +299,61 @@ class ProfileAnalyzerEngine:
         filtered_candidates.sort(key=lambda x: x["final_match_rank"], reverse=True)
         return filtered_candidates[:candidate_k]
 
+    @staticmethod
+    def _extract_photo_evaluations(profile_raw: Dict[str, Any]) -> List[PhotoEvaluation]:
+        """Przenosi photo_evaluations 1:1 z wejściowego JSON-a. Odporne na
+        starsze/uboższe schematy OCR (brak pola -> po prostu pusta lista,
+        żadnego wyjątku)."""
+        raw_list = profile_raw.get("photo_evaluations", [])
+        result = []
+        for item in raw_list:
+            tags = [
+                PhotoTag(label=str(t.get("label", "")), is_positive=bool(t.get("is_positive", False)))
+                for t in item.get("tags", [])
+            ]
+            result.append(PhotoEvaluation(
+                photo_index=item.get("photo_index", 0),
+                action=item.get("action", "Podobne"),
+                tags=tags,
+            ))
+        return result
+
+    @staticmethod
+    def _extract_global_tags(profile_raw: Dict[str, Any]) -> List[PhotoTag]:
+        raw_list = profile_raw.get("global_tags", [])
+        return [
+            PhotoTag(label=str(t.get("label", "")), is_positive=bool(t.get("is_positive", False)))
+            for t in raw_list
+        ]
+
+    @staticmethod
+    def _extract_bio_analysis(profile_raw: Dict[str, Any]) -> Optional[BioAnalysis]:
+        raw = profile_raw.get("bio_analysis")
+        if not raw:
+            return None
+        return BioAnalysis(
+            has_bio=bool(raw.get("has_bio", False)),
+            raw_bio_text=raw.get("raw_bio_text"),
+            language=raw.get("language"),
+            word_count=raw.get("word_count", 0),
+            bio_evaluation=raw.get("bio_evaluation"),
+            bio_suggestions=raw.get("bio_suggestions", []),
+        )
+
+    @staticmethod
+    def _extract_profile_summary(profile_raw: Dict[str, Any]) -> Optional[ProfileSummaryBlock]:
+        raw = profile_raw.get("summary")
+        if not raw:
+            return None
+        return ProfileSummaryBlock(
+            photos_count_evaluation=raw.get("photos_count_evaluation"),
+            top_3_pros=raw.get("top_3_pros", []),
+            top_3_cons=raw.get("top_3_cons", []),
+            single_biggest_improvement=raw.get("single_biggest_improvement"),
+            recommended_photo_order=raw.get("recommended_photo_order", []),
+            photo_action_plan=raw.get("photo_action_plan"),
+        )
+
     def analyze_extracted_json(self, profile_data_path: str, target_rules_count: int = 5) -> ProfileAuditReport:
         with open(profile_data_path, "r", encoding="utf-8") as f:
             profile_raw = json.load(f)
@@ -262,6 +361,8 @@ class ProfileAnalyzerEngine:
         doc_title = profile_raw.get("document_title", Path(profile_data_path).stem)
         extracted_rules = profile_raw.get("extracted_rules", [])
         one_great_thing = profile_raw.get("one_great_thing")
+        total_photos = profile_raw.get("total_photos_analyzed", 0)
+        photo_overall_score = profile_raw.get("overall_score")
 
         detected_candidates: List[Dict[str, Any]] = []
         positive_highlights: List[str] = []
@@ -327,16 +428,32 @@ class ProfileAnalyzerEngine:
 
         penalty_map = {"CRITICAL": 20, "HIGH": 12, "MEDIUM": 8, "LOW": 4}
         total_penalty = sum(penalty_map.get(issue.severity, 8) for issue in final_issues)
-        overall_score = max(0.0, min(100.0, 100.0 - total_penalty))
+        rules_overall_score = max(0.0, min(100.0, 100.0 - total_penalty))
         critical_count = sum(1 for i in final_issues if i.severity == "CRITICAL")
+
+        # Łączny wynik: średnia oceny Vision (jakość zdjęć/profilu) i oceny
+        # naszego silnika RAG (waga trafionych, poważnych reguł). Jeśli OCR
+        # nie dostarczył własnego overall_score (starszy/uboższy schemat),
+        # spadamy do samego wyniku silnika reguł.
+        if isinstance(photo_overall_score, (int, float)):
+            overall_score = round((float(photo_overall_score) + rules_overall_score) / 2, 1)
+        else:
+            overall_score = round(rules_overall_score, 1)
 
         report = ProfileAuditReport(
             profile_name=doc_title,
+            total_photos_analyzed=total_photos,
+            photo_overall_score=photo_overall_score,
+            rules_overall_score=round(rules_overall_score, 1),
+            overall_score=overall_score,
             total_issues=len(final_issues),
             critical_issues_count=critical_count,
-            overall_score=overall_score,
             detected_issues=final_issues,
-            positive_highlights=positive_highlights
+            positive_highlights=positive_highlights,
+            photo_evaluations=self._extract_photo_evaluations(profile_raw),
+            global_tags=self._extract_global_tags(profile_raw),
+            bio_analysis=self._extract_bio_analysis(profile_raw),
+            profile_summary=self._extract_profile_summary(profile_raw),
         )
 
         del profile_raw, extracted_rules, detected_candidates, unique_rules_map, sorted_candidates
@@ -346,15 +463,8 @@ class ProfileAnalyzerEngine:
 
 
 # ---------------------------------------------------------------------------
-# 5. LENIWY SINGLETON SILNIKA
+# 5. LENIWY SINGLETON SILNIKA (bez zmian)
 # ---------------------------------------------------------------------------
-# Krytyczne dla RAM/CPU: silnik (i jego indeks TF-IDF) budowany jest RAZ,
-# przy pierwszym użyciu — a nie przy KAŻDYM zapytaniu API, jak to było
-# poprzednio (main.py tworzył `ProfileAnalyzerEngine(...)` wewnątrz
-# endpointu, więc każde żądanie ładowało od nowa model i przebudowywało
-# całą bazę wektorową). Dzięki temu serwer startuje natychmiast (health
-# check na Renderze nie czeka na ciężką inicjalizację) i nie powtarza tej
-# samej pracy w kółko.
 
 _engine_singleton: Optional["ProfileAnalyzerEngine"] = None
 
@@ -367,15 +477,36 @@ def get_engine(rules_db_path: str = "rules.json") -> "ProfileAnalyzerEngine":
 
 
 # ---------------------------------------------------------------------------
-# 6. FORMATOWANY WYDRUK RAPORTU — bez zmian
+# 6. FORMATOWANY WYDRUK RAPORTU (rozszerzony o photo_evaluations/bio/summary)
 # ---------------------------------------------------------------------------
 
 def print_audit_report(report: ProfileAuditReport):
     print("\n" + "="*65)
     print(f"📊 RAPORT AUDYTU (RAG / HYBRYDOWY): {report.profile_name}")
     print("="*65)
-    print(f"📈 Wynik ogólny: {report.overall_score:.1f} / 100")
+    score_line = f"📈 Wynik ogólny: {report.overall_score:.1f} / 100"
+    if report.photo_overall_score is not None:
+        score_line += f"  (Vision: {report.photo_overall_score:.1f} | Reguły: {report.rules_overall_score:.1f})"
+    print(score_line)
     print(f"❌ Znalezione błędy: {report.total_issues} (Krytycznych: {report.critical_issues_count})\n")
+
+    if report.photo_evaluations:
+        print("-----------------------------------------------------------")
+        print(f"🖼️ OCENA POSZCZEGÓLNYCH ZDJĘĆ ({len(report.photo_evaluations)}):")
+        print("-----------------------------------------------------------")
+        for p in report.photo_evaluations:
+            print(f"  Zdjęcie {p.photo_index}: {p.action}")
+            for t in p.tags:
+                icon = "✅" if t.is_positive else "⚠️"
+                print(f"    {icon} {t.label}")
+        print()
+
+    if report.bio_analysis:
+        print("-----------------------------------------------------------")
+        print("📝 BIO:")
+        print("-----------------------------------------------------------")
+        print(f"  {report.bio_analysis.bio_evaluation or '(brak oceny)'}")
+        print()
 
     if report.detected_issues:
         print("-----------------------------------------------------------")
