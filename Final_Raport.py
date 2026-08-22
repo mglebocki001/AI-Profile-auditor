@@ -57,6 +57,7 @@ _ACTION_COLOR_MAP = {
     "Zostaw": "green",
     "Usuń": "red",
     "Podobne": "orange",
+    "Info": "blue",
 }
 
 

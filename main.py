@@ -195,6 +195,7 @@ def test_interface():
             .action-status.Zostaw { color: #22c55e; }
             .action-status.Usuń { color: #f43f5e; }
             .action-status.Podobne { color: #eab308; }
+            .action-status.Info { color: #60a5fa; }
 
             .tags-list {
                 margin-top: 10px;

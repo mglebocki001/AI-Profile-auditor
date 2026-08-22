@@ -24,9 +24,9 @@ class PhotoTag(BaseModel):
     is_positive: bool = Field(description="True dla zalety, False dla wady.")
 
 class PhotoEvaluation(BaseModel):
-    photo_index: int = Field(description="Numer zdjęcia (1-based).")
-    action: str = Field(description="Rekomendacja: 'Zostaw', 'Usuń' lub 'Podobne'.")
-    tags: List[PhotoTag] = Field(description="Etykiety oceniające zdjęcie.")
+    photo_index: int = Field(description="Numer obrazu (1-based) DOKŁADNIE zgodny z kolejnością, w jakiej obrazy zostały przesłane. Nigdy nie pomijaj numerów.")
+    action: str = Field(description="Rekomendacja: 'Zostaw', 'Usuń', 'Podobne' lub 'Info' (dla ekranów, które NIE są zdjęciem osoby - np. czysty ekran z opisem/bio/statystykami/promptami).")
+    tags: List[PhotoTag] = Field(description="Etykiety oceniające zdjęcie. Dla obrazów typu 'Info' użyj tagów opisujących zawartość ekranu (np. 'Ekran z opisem profilu'), NIGDY tagów o twarzy/ubiorze/świetle.")
 
 class BioAnalysis(BaseModel):
     has_bio: bool = Field(description="Czy użytkownik posiada opis/bio.")
@@ -111,6 +111,49 @@ def _load_compressed_jpeg_bytes(path: Path) -> Optional[bytes]:
         return None
 
 
+def _reconcile_photo_evaluations(result: "SingleProfileFullAudit", num_images: int) -> None:
+    """Zabezpieczenie na wypadek, gdyby model mimo instrukcji pominął/przesunął
+    numerację obrazów (np. pomijając ekran z samym bio). Działa w miejscu
+    (mutuje result.photo_evaluations), żeby dalsza część kodu (Final_Raport.py,
+    frontend) zawsze mogła bezpiecznie zakładać: photo_index i-tej oceny
+    odpowiada i-temu przesłanemu plikowi, 1:1, bez luk."""
+    evaluations = result.photo_evaluations
+
+    if len(evaluations) != num_images:
+        print(
+            f"⚠️ UWAGA: model zwrócił {len(evaluations)} ocen zdjęć, "
+            f"a przesłano {num_images} obrazów. Wymuszam wyrównanie kolejności - "
+            f"sprawdź logi/wynik ręcznie, bo część ocen może nie odpowiadać "
+            f"właściwym zdjęciom."
+        )
+
+    # Ufamy KOLEJNOŚCI, w jakiej model zwrócił listę (to zwykle odpowiada
+    # kolejności przesłanych obrazów, nawet gdy model pomyli się w numeracji
+    # photo_index) i wymuszamy numerację 1..N zgodną z pozycją w liście.
+    for position, evaluation in enumerate(evaluations, start=1):
+        evaluation.photo_index = position
+
+    if len(evaluations) < num_images:
+        # Model pominął jakiś obraz - dopełniamy listę, żeby liczba ocen
+        # zawsze zgadzała się z liczbą przesłanych plików (frontend indeksuje
+        # zdjęcia po pozycji, więc brakujący wpis psuje wszystko co po nim).
+        for position in range(len(evaluations) + 1, num_images + 1):
+            evaluations.append(
+                PhotoEvaluation(
+                    photo_index=position,
+                    action="Info",
+                    tags=[PhotoTag(
+                        label="Nie udało się jednoznacznie ocenić tego obrazu automatycznie",
+                        is_positive=True,
+                    )],
+                )
+            )
+    elif len(evaluations) > num_images:
+        del evaluations[num_images:]
+
+    result.total_photos_analyzed = num_images
+
+
 def process_single_profile(client: OpenAI, image_paths: List[Path]) -> Optional[SingleProfileFullAudit]:
     print(f"🔄 Rozpoczynanie analizy dla {len(image_paths)} zdjęć...")
 
@@ -130,10 +173,12 @@ def process_single_profile(client: OpenAI, image_paths: List[Path]) -> Optional[
         print("❌ Nie udało się przetworzyć żadnego zdjęcia.")
         return None
 
-    prompt = """
+    num_images = len(image_parts)
+
+    prompt = f"""
 Jesteś profesjonalnym, wymagającym i bezstronnym audytorem profili w aplikacjach randkowych (Tinder, Bumble, Hinge).
 
-Otrzymasz ZAŁĄCZONY ZESTAW OBRAZÓW przedstawiających JEDEN PEŁNY PROFIL UŻYTKOWNIKA. Przeanalizuj WSZYSTKIE załączone obrazy jako jedną spójną całość.
+Otrzymasz ZAŁĄCZONY ZESTAW DOKŁADNIE {num_images} OBRAZÓW przedstawiających JEDEN PEŁNY PROFIL UŻYTKOWNIKA, w konkretnej, ustalonej kolejności (obraz 1, obraz 2, ..., obraz {num_images}). Przeanalizuj WSZYSTKIE załączone obrazy jako jedną spójną całość.
 
 ZASADY ANALIZY:
 1. Opieraj się WYŁĄCZNIE na informacjach widocznych na obrazach. Nie zgaduj danych, jeśli nie wynikają z tekstu/zdjęć.
@@ -141,8 +186,14 @@ ZASADY ANALIZY:
    - Odczytaj dokładną treść tekstu (raw_bio_text). Jeśli opisu brak, ustaw has_bio na false i wskaż to w opisie.
    - Zlicz dokładnie liczbę znaków (character_count), liczbę słów (word_count) oraz użyte emoji (emoji_count).
    - Określ język (language) oraz oszacuj jakość opisu (bio_evaluation) wraz ze wskazówkami poprawy (bio_suggestions).
-3. Przeanalizuj każde zdjęcie z osobna i przydziel mu akcję ("Zostaw", "Usuń", "Podobne") oraz odpowiednie tagi (label, is_positive).
+3. Przeanalizuj KAŻDY z {num_images} obrazów, jeden po drugim i przydziel mu akcję oraz odpowiednie tagi.
 4. Wylicz ogólną punktację profilu w skali 0–100 (overall_score).
+
+⚠️ KRYTYCZNIE WAŻNA ZASADA DOTYCZĄCA `photo_evaluations` (rygorystycznie przestrzegaj):
+- Tablica `photo_evaluations` MUSI zawierać DOKŁADNIE {num_images} elementów - po jednym na KAŻDY przesłany obraz, BEZ WYJĄTKU.
+- `photo_index` musi być równy numerowi kolejnemu obrazu zgodnie z kolejnością przesyłania: pierwszy przesłany obraz = photo_index 1, drugi = photo_index 2, itd. aż do {num_images}. Nie wolno pomijać, łączyć ani przestawiać numerów.
+- NIGDY nie pomijaj obrazu tylko dlatego, że nie przedstawia on bezpośrednio osoby (np. jest to ekran z samym tekstem opisu/bio, listą zainteresowań, statystykami typu wzrost/znak zodiaku, promptami/pytaniami). Taki obraz TEŻ dostaje swój wpis w `photo_evaluations`, tylko z action="Info" i tagami opisującymi WYŁĄCZNIE zawartość tego ekranu (np. "Ekran z opisem profilu", "Lista zainteresowań") - nigdy nie pisz dla niego o twarzy, ubiorze, świetle czy kadrze, bo to nie jest zdjęcie osoby.
+- Przed zwróceniem odpowiedzi PRZELICZ swoje `photo_evaluations` i upewnij się, że ich liczba to dokładnie {num_images}, a numery photo_index to kolejno 1, 2, 3, ..., {num_images} bez luk i powtórzeń.
 
 WYMAGANY FORMAT WYJŚCIOWY (JSON):
 
@@ -170,6 +221,13 @@ WYMAGANY FORMAT WYJŚCIOWY (JSON):
       "tags": [
         {"label": "Wyraźnie widoczna twarz", "is_positive": true},
         {"label": "Słabe światło", "is_positive": false}
+      ]
+    },
+    {
+      "photo_index": 2,
+      "action": "Info",
+      "tags": [
+        {"label": "Ekran z opisem profilu (bio) - nie jest to zdjęcie osoby", "is_positive": true}
       ]
     }
   ],
@@ -243,6 +301,7 @@ WYMAGANY FORMAT WYJŚCIOWY (JSON):
         )
         result = response.output_parsed
         print("✅ Pomyślnie odebrano odpowiedź z API OpenAI.")
+        _reconcile_photo_evaluations(result, num_images)
         del response
         return result
     except Exception as e:
