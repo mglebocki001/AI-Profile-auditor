@@ -175,10 +175,10 @@ def process_single_profile(client: OpenAI, image_paths: List[Path]) -> Optional[
 
     num_images = len(image_parts)
 
-    prompt = f"""
+    prompt = """
 Jesteś profesjonalnym, wymagającym i bezstronnym audytorem profili w aplikacjach randkowych (Tinder, Bumble, Hinge).
 
-Otrzymasz ZAŁĄCZONY ZESTAW DOKŁADNIE {num_images} OBRAZÓW przedstawiających JEDEN PEŁNY PROFIL UŻYTKOWNIKA, w konkretnej, ustalonej kolejności (obraz 1, obraz 2, ..., obraz {num_images}). Przeanalizuj WSZYSTKIE załączone obrazy jako jedną spójną całość.
+Otrzymasz ZAŁĄCZONY ZESTAW DOKŁADNIE __NUM_IMAGES__ OBRAZÓW przedstawiających JEDEN PEŁNY PROFIL UŻYTKOWNIKA, w konkretnej, ustalonej kolejności (obraz 1, obraz 2, ..., obraz __NUM_IMAGES__). Przeanalizuj WSZYSTKIE załączone obrazy jako jedną spójną całość.
 
 ZASADY ANALIZY:
 1. Opieraj się WYŁĄCZNIE na informacjach widocznych na obrazach. Nie zgaduj danych, jeśli nie wynikają z tekstu/zdjęć.
@@ -186,14 +186,14 @@ ZASADY ANALIZY:
    - Odczytaj dokładną treść tekstu (raw_bio_text). Jeśli opisu brak, ustaw has_bio na false i wskaż to w opisie.
    - Zlicz dokładnie liczbę znaków (character_count), liczbę słów (word_count) oraz użyte emoji (emoji_count).
    - Określ język (language) oraz oszacuj jakość opisu (bio_evaluation) wraz ze wskazówkami poprawy (bio_suggestions).
-3. Przeanalizuj KAŻDY z {num_images} obrazów, jeden po drugim i przydziel mu akcję oraz odpowiednie tagi.
+3. Przeanalizuj KAŻDY z __NUM_IMAGES__ obrazów, jeden po drugim i przydziel mu akcję oraz odpowiednie tagi.
 4. Wylicz ogólną punktację profilu w skali 0–100 (overall_score).
 
 ⚠️ KRYTYCZNIE WAŻNA ZASADA DOTYCZĄCA `photo_evaluations` (rygorystycznie przestrzegaj):
-- Tablica `photo_evaluations` MUSI zawierać DOKŁADNIE {num_images} elementów - po jednym na KAŻDY przesłany obraz, BEZ WYJĄTKU.
-- `photo_index` musi być równy numerowi kolejnemu obrazu zgodnie z kolejnością przesyłania: pierwszy przesłany obraz = photo_index 1, drugi = photo_index 2, itd. aż do {num_images}. Nie wolno pomijać, łączyć ani przestawiać numerów.
+- Tablica `photo_evaluations` MUSI zawierać DOKŁADNIE __NUM_IMAGES__ elementów - po jednym na KAŻDY przesłany obraz, BEZ WYJĄTKU.
+- `photo_index` musi być równy numerowi kolejnemu obrazu zgodnie z kolejnością przesyłania: pierwszy przesłany obraz = photo_index 1, drugi = photo_index 2, itd. aż do __NUM_IMAGES__. Nie wolno pomijać, łączyć ani przestawiać numerów.
 - NIGDY nie pomijaj obrazu tylko dlatego, że nie przedstawia on bezpośrednio osoby (np. jest to ekran z samym tekstem opisu/bio, listą zainteresowań, statystykami typu wzrost/znak zodiaku, promptami/pytaniami). Taki obraz TEŻ dostaje swój wpis w `photo_evaluations`, tylko z action="Info" i tagami opisującymi WYŁĄCZNIE zawartość tego ekranu (np. "Ekran z opisem profilu", "Lista zainteresowań") - nigdy nie pisz dla niego o twarzy, ubiorze, świetle czy kadrze, bo to nie jest zdjęcie osoby.
-- Przed zwróceniem odpowiedzi PRZELICZ swoje `photo_evaluations` i upewnij się, że ich liczba to dokładnie {num_images}, a numery photo_index to kolejno 1, 2, 3, ..., {num_images} bez luk i powtórzeń.
+- Przed zwróceniem odpowiedzi PRZELICZ swoje `photo_evaluations` i upewnij się, że ich liczba to dokładnie __NUM_IMAGES__, a numery photo_index to kolejno 1, 2, 3, ..., __NUM_IMAGES__ bez luk i powtórzeń.
 
 WYMAGANY FORMAT WYJŚCIOWY (JSON):
 
@@ -285,6 +285,7 @@ WYMAGANY FORMAT WYJŚCIOWY (JSON):
   }
 }
 """
+    prompt = prompt.replace("__NUM_IMAGES__", str(num_images))
 
     contents = [{
         "role": "user",
