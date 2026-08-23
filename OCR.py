@@ -154,7 +154,13 @@ def _reconcile_photo_evaluations(result: "SingleProfileFullAudit", num_images: i
     result.total_photos_analyzed = num_images
 
 
-def process_single_profile(client: OpenAI, image_paths: List[Path]) -> Optional[SingleProfileFullAudit]:
+LANGUAGE_NAMES = {
+    'pl': 'polskim',
+    'en': 'angielskim (English)',
+}
+
+
+def process_single_profile(client: OpenAI, image_paths: List[Path], language: str = 'pl') -> Optional[SingleProfileFullAudit]:
     print(f"🔄 Rozpoczynanie analizy dla {len(image_paths)} zdjęć...")
 
     image_parts = []
@@ -174,6 +180,7 @@ def process_single_profile(client: OpenAI, image_paths: List[Path]) -> Optional[
         return None
 
     num_images = len(image_parts)
+    language_name = LANGUAGE_NAMES.get(language, LANGUAGE_NAMES['pl'])
 
     prompt = """
 Jesteś profesjonalnym, wymagającym i bezstronnym audytorem profili w aplikacjach randkowych (Tinder, Bumble, Hinge).
@@ -194,6 +201,11 @@ ZASADY ANALIZY:
 - `photo_index` musi być równy numerowi kolejnemu obrazu zgodnie z kolejnością przesyłania: pierwszy przesłany obraz = photo_index 1, drugi = photo_index 2, itd. aż do __NUM_IMAGES__. Nie wolno pomijać, łączyć ani przestawiać numerów.
 - NIGDY nie pomijaj obrazu tylko dlatego, że nie przedstawia on bezpośrednio osoby (np. jest to ekran z samym tekstem opisu/bio, listą zainteresowań, statystykami typu wzrost/znak zodiaku, promptami/pytaniami). Taki obraz TEŻ dostaje swój wpis w `photo_evaluations`, tylko z action="Info" i tagami opisującymi WYŁĄCZNIE zawartość tego ekranu (np. "Ekran z opisem profilu", "Lista zainteresowań") - nigdy nie pisz dla niego o twarzy, ubiorze, świetle czy kadrze, bo to nie jest zdjęcie osoby.
 - Przed zwróceniem odpowiedzi PRZELICZ swoje `photo_evaluations` i upewnij się, że ich liczba to dokładnie __NUM_IMAGES__, a numery photo_index to kolejno 1, 2, 3, ..., __NUM_IMAGES__ bez luk i powtórzeń.
+
+⚠️ KRYTYCZNIE WAŻNA ZASADA DOTYCZĄCA JĘZYKA ODPOWIEDZI:
+- CAŁA Twoja odpowiedź (etykiety tagów w `tags`, opisy w `raw_visual_observations`, `bio_evaluation`, `bio_suggestions`, `one_great_thing`, `extracted_rules`, `summary` i wszystkie pozostałe pola tekstowe generowane przez Ciebie) MUSI być napisana w języku __LANGUAGE_NAME__.
+- JEDYNY WYJĄTEK: pole `raw_bio_text` musi pozostać dosłownym, niezmienionym cytatem tekstu bio dokładnie tak, jak jest napisany na zrzucie ekranu - nie tłumacz go, nawet jeśli oryginalny język bio różni się od __LANGUAGE_NAME__. Pole `language` w `bio_analysis` nadal opisuje wykryty język ORYGINALNEGO bio (nie język Twojej odpowiedzi).
+- Ta zasada ma pierwszeństwo przed jakimikolwiek innymi przykładami w tym prompcie, które mogły być napisane po polsku - to tylko przykłady struktury JSON, nie wzorzec językowy do naśladowania.
 
 WYMAGANY FORMAT WYJŚCIOWY (JSON):
 
@@ -286,6 +298,7 @@ WYMAGANY FORMAT WYJŚCIOWY (JSON):
 }
 """
     prompt = prompt.replace("__NUM_IMAGES__", str(num_images))
+    prompt = prompt.replace("__LANGUAGE_NAME__", language_name)
 
     contents = [{
         "role": "user",
@@ -313,7 +326,7 @@ WYMAGANY FORMAT WYJŚCIOWY (JSON):
         gc.collect()
 
 
-def run_batch_extraction(input_dir: str = "./photos", output_dir: str = "./OCR_result"):
+def run_batch_extraction(input_dir: str = "./photos", output_dir: str = "./OCR_result", language: str = 'pl'):
     print("=" * 50)
     print("🚀 Inicjalizacja skryptu OCR.py")
     print("=" * 50)
@@ -341,7 +354,7 @@ def run_batch_extraction(input_dir: str = "./photos", output_dir: str = "./OCR_r
         print(f"   - {img.name}")
 
     client = OpenAI(api_key=API_KEY)
-    result = process_single_profile(client, images)
+    result = process_single_profile(client, images, language=language)
 
     if result:
         output_file = output_path / "FULL_PROFILE_AUDIT.json"

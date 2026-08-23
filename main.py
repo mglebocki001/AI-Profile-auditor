@@ -4,7 +4,7 @@ import gc
 import json
 from pathlib import Path
 from typing import List
-from fastapi import FastAPI, UploadFile, File, HTTPException, Request
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
@@ -53,7 +53,13 @@ def clean_working_directories():
                 print(f"⚠️ Nie udało się usunąć {item}: {e}")
 
 @app.post("/analyze-profile")
-async def analyze_profile_endpoint(files: List[UploadFile] = File(...)):
+async def analyze_profile_endpoint(
+    files: List[UploadFile] = File(...),
+    language: str = Form('pl'),
+):
+    # Obsługujemy tylko języki dostępne na stronie - każda inna wartość spada do polskiego
+    if language not in ('pl', 'en'):
+        language = 'pl'
     if not files:
         raise HTTPException(status_code=400, detail="Brak przesłanych plików.")
 
@@ -70,7 +76,7 @@ async def analyze_profile_endpoint(files: List[UploadFile] = File(...)):
 
    # 1. Ekstrakcja danych OCR
     try:
-        run_batch_extraction(input_dir=str(PHOTOS_DIR), output_dir=str(OCR_RESULT_DIR))
+        run_batch_extraction(input_dir=str(PHOTOS_DIR), output_dir=str(OCR_RESULT_DIR), language=language)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Błąd OCR: {str(e)}")
 
@@ -90,7 +96,7 @@ async def analyze_profile_endpoint(files: List[UploadFile] = File(...)):
 
     # 3. Synteza i tworzenie final_profile_summary.json
     try:
-        generate_summary_for_reports(reports_dir=str(AUDIT_REPORTS_DIR), output_dir=str(FINAL_SUMMARY_DIR))
+        generate_summary_for_reports(reports_dir=str(AUDIT_REPORTS_DIR), output_dir=str(FINAL_SUMMARY_DIR), language=language)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Błąd podczas generowania syntezy końcowej: {str(e)}")
 

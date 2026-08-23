@@ -12,6 +12,11 @@ load_dotenv()
 API_KEY = os.getenv("OPENAI_API_KEY")
 MODEL_NAME = "gpt-5.6-terra"
 
+LANGUAGE_NAMES = {
+    'pl': 'polskim',
+    'en': 'angielskim (English)',
+}
+
 # ---------------------------------------------------------------------------
 # 1. SCHEMAT DLA MODELU — WYŁĄCZNIE część generatywna/kreatywna.
 #    Dane per-zdjęcie NIE wchodzą tu w ogóle.
@@ -89,7 +94,7 @@ def _build_photo_by_photo(audit_data: dict) -> List[dict]:
 # ---------------------------------------------------------------------------
 # 3. SILNIK SYNTEZY RAPORTÓW (GPT-5.6-TERRA)
 # ---------------------------------------------------------------------------
-def generate_summary_for_reports(reports_dir: str, output_dir: str):
+def generate_summary_for_reports(reports_dir: str, output_dir: str, language: str = 'pl'):
     if not API_KEY or API_KEY == "TUTAJ_WKLEJ_SWOJ_KLUCZ_API":
         print("❌ BŁĄD: Ustaw OPENAI_API_KEY w pliku .env!")
         return
@@ -118,6 +123,7 @@ def generate_summary_for_reports(reports_dir: str, output_dir: str):
     bio_analysis = primary_audit.get("bio_analysis") or {}
     original_bio_text = bio_analysis.get("raw_bio_text") or ""
     bio_language = bio_analysis.get("language") or "pl"
+    response_language_name = LANGUAGE_NAMES.get(language, LANGUAGE_NAMES['pl'])
 
     prompt = f"""
 Przeanalizuj poniższe szczegółowe dane z audytu profilu na aplikacji randkowej:
@@ -126,13 +132,17 @@ Przeanalizuj poniższe szczegółowe dane z audytu profilu na aplikacji randkowe
 
 Twoim zadaniem jest stworzenie krótkiego, potężnego podsumowania wygenerowanego bezpośrednio dla użytkownika, ORAZ propozycji poprawionego bio.
 
+⚠️ WAŻNA ZASADA JĘZYKOWA (przestrzegaj rygorystycznie, dotyczy każdego pola z osobna):
+- Pola 'overall_action_plan_summary', 'one_great_thing', 'top_5_improvements' (title, why_it_matters, quick_fix) oraz 'why_better' MUSZĄ być napisane w języku {response_language_name} - to są komentarze/wyjaśnienia DLA użytkownika czytającego stronę w tym języku.
+- Pole 'improved_bio' jest WYJĄTKIEM od powyższej zasady: MUSI pozostać w oryginalnym języku bio użytkownika ({bio_language}), niezależnie od języka {response_language_name} - bo użytkownik wklei ten tekst bezpośrednio na swój profil randkowy, który jest w tamtym języku.
+
 Wymagania:
 1. W polu 'overall_action_plan_summary' napisz zwięzłą syntezę (3-5 zdań), w której podsumujesz cały profil: co jest dobrą bazą i należy zostawić, co bezwzględnie usunąć lub zmienić, oraz jaki jest główny priorytet zmian. Uwzględnij WSZYSTKIE dostępne dane: oceny poszczególnych zdjęć (photo_evaluations), globalne tagi (global_tags), analizę bio (bio_analysis) i wykryte reguły (detected_issues).
 2. W polu 'one_great_thing' znajdź DOKŁADNIE 1 rzecz, która na tym profilu jest najwyższej jakości lub wyróżnia go na plus.
 3. W polu 'top_5_improvements' wybierz DOKŁADNIE 5 najważniejszych, a zarazem NAJŁATWIEJSZYCH do natychmiastowego zastosowania zmian — czerp zarówno z detected_issues, jak i z profile_summary/bio_analysis.
 4. W polu 'bio_suggestion' napisz gotową, poprawioną wersję bio użytkownika:
    - Oryginalne bio: "{original_bio_text}"
-   - Język oryginału: {bio_language} — napisz poprawkę w TYM SAMYM języku.
+   - Język oryginału: {bio_language} — napisz 'improved_bio' w TYM SAMYM języku (patrz zasada językowa powyżej).
    - Uwzględnij wykryte zainteresowania (interests_and_passions) i uwagi z bio_analysis.bio_suggestions, jeśli są dostępne.
    - Bio ma brzmieć naturalnie, jak coś, co realny użytkownik faktycznie by o sobie napisał — nie jak reklama.
 5. Mów językiem korzyści, bezpośrednio, bez akademickiego lania wody.
