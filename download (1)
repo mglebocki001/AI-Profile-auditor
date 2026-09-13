@@ -1,0 +1,6 @@
+.env
+photos/
+OCR_result/
+audit_reports/
+final_summary/
+__pycache__/

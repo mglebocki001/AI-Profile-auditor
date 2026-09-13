@@ -56,6 +56,12 @@ def clean_working_directories():
 async def analyze_profile_endpoint(
     files: List[UploadFile] = File(...),
     language: str = Form('pl'),
+    # Odpowiedzi z 3-pytaniowej ankiety na podstronie /raport (patrz frontend
+    # src/pages/Raport.jsx). Wszystkie opcjonalne - stare wywołania bez tych
+    # pól nadal działają, po prostu bez personalizacji pod kątem preferencji.
+    relationshipGoal: str = Form(''),   # 'serious' | 'dating' | 'casual' | 'nostrings' | 'unsure'
+    attractTraits: str = Form(''),      # np. "intelligent,funny,active" (max 3, przecinki)
+    selfTraits: str = Form(''),         # np. "confident,warm,mature" (max 3, przecinki)
 ):
     # Obsługujemy tylko języki dostępne na stronie - każda inna wartość spada do polskiego
     if language not in ('pl', 'en'):
@@ -96,7 +102,14 @@ async def analyze_profile_endpoint(
 
     # 3. Synteza i tworzenie final_profile_summary.json
     try:
-        generate_summary_for_reports(reports_dir=str(AUDIT_REPORTS_DIR), output_dir=str(FINAL_SUMMARY_DIR), language=language)
+        generate_summary_for_reports(
+            reports_dir=str(AUDIT_REPORTS_DIR),
+            output_dir=str(FINAL_SUMMARY_DIR),
+            language=language,
+            relationship_goal=relationshipGoal,
+            attract_traits=attractTraits,
+            self_traits=selfTraits,
+        )
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Błąd podczas generowania syntezy końcowej: {str(e)}")
 

@@ -18,6 +18,97 @@ LANGUAGE_NAMES = {
 }
 
 # ---------------------------------------------------------------------------
+# Odpowiedzi z ankiety na /raport (patrz frontend: src/pages/Raport.jsx,
+# GOAL_VALUES / ATTRACT_KEYS / SELF_KEYS) - mapujemy kody na czytelny opis,
+# żeby model dostał gotowe zdanie zamiast surowego identyfikatora.
+# ---------------------------------------------------------------------------
+RELATIONSHIP_GOAL_LABELS = {
+    'pl': {
+        'serious': 'poważnej, długoterminowej relacji',
+        'dating': 'randkowania i poznawania nowych osób',
+        'casual': 'czegoś luźnego, bez większych zobowiązań',
+        'nostrings': 'czegoś całkowicie niezobowiązującego',
+        'unsure': 'jeszcze nie wie, czego dokładnie szuka',
+    },
+    'en': {
+        'serious': 'a serious, long-term relationship',
+        'dating': 'dating around and meeting new people',
+        'casual': 'something casual, without big commitments',
+        'nostrings': 'something completely no-strings-attached',
+        'unsure': 'is not sure yet what they are looking for',
+    },
+}
+
+# Klucze zgodne z i18n_complete.json -> raport.step2.options (kogo chce przyciągać).
+ATTRACT_TRAIT_LABELS = {
+    'pl': {
+        'intelligent': 'inteligentne', 'funny': 'zabawne', 'active': 'aktywne',
+        'family': 'rodzinne', 'social': 'towarzyskie', 'calm': 'spokojne',
+        'ambitious': 'ambitne', 'other': 'inne',
+    },
+    'en': {
+        'intelligent': 'intelligent', 'funny': 'funny', 'active': 'active',
+        'family': 'family-oriented', 'social': 'sociable', 'calm': 'calm',
+        'ambitious': 'ambitious', 'other': 'other people in general',
+    },
+}
+
+# Klucze zgodne z i18n_complete.json -> raport.step3.options (jak chce być odbierany).
+SELF_TRAIT_LABELS = {
+    'pl': {
+        'confident': 'pewny siebie', 'funny': 'zabawny', 'intelligent': 'inteligentny',
+        'warm': 'ciepły', 'attractive': 'atrakcyjny', 'interesting': 'ciekawy',
+        'mature': 'dojrzały', 'active': 'aktywny',
+    },
+    'en': {
+        'confident': 'confident', 'funny': 'funny', 'intelligent': 'intelligent',
+        'warm': 'warm', 'attractive': 'attractive', 'interesting': 'interesting',
+        'mature': 'mature', 'active': 'active',
+    },
+}
+
+
+def _describe_goal(code: str, language: str) -> Optional[str]:
+    labels = RELATIONSHIP_GOAL_LABELS.get(language, RELATIONSHIP_GOAL_LABELS['pl'])
+    return labels.get((code or '').strip())
+
+
+def _describe_traits(codes_csv: str, mapping: dict, language: str) -> List[str]:
+    if not codes_csv:
+        return []
+    labels = mapping.get(language, mapping['pl'])
+    codes = [c.strip() for c in codes_csv.split(',') if c.strip()]
+    return [labels.get(c, c) for c in codes]
+
+
+def _build_preferences_block(relationship_goal: str, attract_traits: str, self_traits: str, language: str) -> str:
+    """Składa czytelny opis odpowiedzi z ankiety /raport do wstrzyknięcia w prompt.
+    Zwraca pusty string, gdy użytkownik nic nie wybrał (np. stare wywołania API
+    sprzed dodania ankiety) - wtedy prompt po prostu pomija tę sekcję."""
+    lines = []
+    goal_desc = _describe_goal(relationship_goal, language)
+    attract_list = _describe_traits(attract_traits, ATTRACT_TRAIT_LABELS, language)
+    self_list = _describe_traits(self_traits, SELF_TRAIT_LABELS, language)
+
+    if language == 'pl':
+        if goal_desc:
+            lines.append(f"- Szuka na aplikacji: {goal_desc}.")
+        if attract_list:
+            lines.append(f"- Chce przyciągać osoby, które są: {', '.join(attract_list)}.")
+        if self_list:
+            lines.append(f"- Chce, żeby profil sprawiał wrażenie, że jest: {', '.join(self_list)}.")
+    else:
+        if goal_desc:
+            lines.append(f"- Looking for: {goal_desc}.")
+        if attract_list:
+            lines.append(f"- Wants to attract people who are: {', '.join(attract_list)}.")
+        if self_list:
+            lines.append(f"- Wants the profile to come across as: {', '.join(self_list)}.")
+
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
 # 1. SCHEMAT DLA MODELU — WYŁĄCZNIE część generatywna/kreatywna.
 #    Dane per-zdjęcie NIE wchodzą tu w ogóle.
 # ---------------------------------------------------------------------------
@@ -94,7 +185,14 @@ def _build_photo_by_photo(audit_data: dict) -> List[dict]:
 # ---------------------------------------------------------------------------
 # 3. SILNIK SYNTEZY RAPORTÓW (GPT-5.6-TERRA)
 # ---------------------------------------------------------------------------
-def generate_summary_for_reports(reports_dir: str, output_dir: str, language: str = 'pl'):
+def generate_summary_for_reports(
+    reports_dir: str,
+    output_dir: str,
+    language: str = 'pl',
+    relationship_goal: str = '',
+    attract_traits: str = '',
+    self_traits: str = '',
+):
     if not API_KEY or API_KEY == "TUTAJ_WKLEJ_SWOJ_KLUCZ_API":
         print("❌ BŁĄD: Ustaw OPENAI_API_KEY w pliku .env!")
         return
@@ -124,12 +222,39 @@ def generate_summary_for_reports(reports_dir: str, output_dir: str, language: st
     original_bio_text = bio_analysis.get("raw_bio_text") or ""
     bio_language = bio_analysis.get("language") or "pl"
     response_language_name = LANGUAGE_NAMES.get(language, LANGUAGE_NAMES['pl'])
+    preferences_block = _build_preferences_block(relationship_goal, attract_traits, self_traits, language)
+
+    if preferences_block:
+        if language == 'pl':
+            preferences_section = f"""
+Użytkownik dodatkowo odpowiedział na krótką ankietę o swoich celach randkowych:
+{preferences_block}
+
+WAŻNE: uwzględnij te preferencje przy pisaniu 'overall_action_plan_summary', doborze
+'top_5_improvements' oraz - przede wszystkim - w treści 'improved_bio'. Ton, słownictwo
+i zaproszenie do rozmowy w poprawionym bio mają pasować do powyższego celu i cech, które
+użytkownik chce przekazać (np. poważny cel = cieplejszy, dojrzalszy ton i pytanie
+zachęcające do głębszej rozmowy; coś luźnego/na szybko = lżejszy, żartobliwy ton).
+"""
+        else:
+            preferences_section = f"""
+The user additionally answered a short survey about their dating goals:
+{preferences_block}
+
+IMPORTANT: take these preferences into account when writing 'overall_action_plan_summary',
+choosing 'top_5_improvements', and - most importantly - in the 'improved_bio' content. The
+tone, vocabulary, and conversation hook in the improved bio should match the goal and traits
+above (e.g. a serious goal = warmer, more mature tone and a question inviting deeper
+conversation; something casual = a lighter, more playful tone).
+"""
+    else:
+        preferences_section = ""
 
     prompt = f"""
 Przeanalizuj poniższe szczegółowe dane z audytu profilu na aplikacji randkowej:
 
 {json.dumps(combined_audits, ensure_ascii=False, indent=2)}
-
+{preferences_section}
 Twoim zadaniem jest stworzenie krótkiego, potężnego podsumowania wygenerowanego bezpośrednio dla użytkownika, ORAZ propozycji poprawionego bio.
 
 ⚠️ WAŻNA ZASADA JĘZYKOWA (przestrzegaj rygorystycznie, dotyczy każdego pola z osobna):
